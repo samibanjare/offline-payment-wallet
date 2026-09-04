@@ -1,16 +1,15 @@
 // server/index.js
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-import dotenv from 'dotenv';
-dotenv.config();
 
 // In-memory central ledger store (simulates database)
 const centralLedger = {
-  wallets: {},           // wallet_id -> { lastSettledNonce, balance }
+  wallets: {},                    // wallet_id -> { lastSettledNonce, balance }
   settledTransactions: new Map(), // txId -> transaction record
 };
 
@@ -39,8 +38,13 @@ app.post('/v1/sync', (req, res) => {
   console.log(`[Clearance] Sender: ${sender} -> Receiver: ${receiver} | Amount: $${amount} | Nonce: ${nonce}`);
 
   // 1. Validate payload completeness
-  if (!transactionId || !sender || !receiver || !amount) {
+  if (!transactionId || !sender || !receiver || !amount || nonce === undefined) {
     return res.status(400).json({ error: 'Incomplete transaction payload' });
+  }
+
+  const parsedAmount = parseFloat(amount);
+  if (isNaN(parsedAmount) || parsedAmount <= 0) {
+    return res.status(400).json({ error: 'Invalid transaction amount' });
   }
 
   // 2. Anti-Replay: Transaction already settled
@@ -53,9 +57,11 @@ app.post('/v1/sync', (req, res) => {
     });
   }
 
-  // 3. Monotonic Nonce & Double-Spend Gate
+  // 3. Retrieve or initialize wallet states
   const senderState = centralLedger.wallets[sender] || { lastSettledNonce: 0, balance: 1000.0 };
+  const receiverState = centralLedger.wallets[receiver] || { lastSettledNonce: 0, balance: 1000.0 };
 
+  // 4. Monotonic Nonce & Double-Spend Gate
   if (nonce <= senderState.lastSettledNonce) {
     console.error(
       `🚨 [DOUBLE-SPEND DETECTED] Rejected TX ${transactionId}. Nonce ${nonce} <= Last settled nonce ${senderState.lastSettledNonce}`
@@ -66,21 +72,28 @@ app.post('/v1/sync', (req, res) => {
     });
   }
 
-  // 4. Update Central Ledger State
+  // 5. Balance Validation Gate
+  if (senderState.balance < parsedAmount) {
+    console.error(`🚨 [INSUFFICIENT FUNDS] TX ${transactionId}. Balance: ${senderState.balance} < Amount: ${parsedAmount}`);
+    return res.status(400).json({
+      error: 'INSUFFICIENT_FUNDS',
+      message: `Sender balance ($${senderState.balance}) cannot cover amount ($${parsedAmount}).`,
+    });
+  }
+
+  // 6. Update Central Ledger State
   senderState.lastSettledNonce = nonce;
-  senderState.balance = Math.round((senderState.balance - parseFloat(amount)) * 100) / 100;
+  senderState.balance = Math.round((senderState.balance - parsedAmount) * 100) / 100;
   centralLedger.wallets[sender] = senderState;
 
-  // Credit receiver on central ledger
-  const receiverState = centralLedger.wallets[receiver] || { lastSettledNonce: 0, balance: 1000.0 };
-  receiverState.balance = Math.round((receiverState.balance + parseFloat(amount)) * 100) / 100;
+  receiverState.balance = Math.round((receiverState.balance + parsedAmount) * 100) / 100;
   centralLedger.wallets[receiver] = receiverState;
 
   const record = {
     transactionId,
     sender,
     receiver,
-    amount: parseFloat(amount),
+    amount: parsedAmount,
     nonce,
     signature,
     settledAt: Date.now(),
@@ -99,7 +112,6 @@ app.post('/v1/sync', (req, res) => {
 
 /**
  * Inspection Endpoint: GET /v1/ledger
- * Check central balances and settled history in your browser
  */
 app.get('/v1/ledger', (req, res) => {
   res.json({
