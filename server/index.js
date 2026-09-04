@@ -121,6 +121,19 @@ app.get('/v1/ledger', (req, res) => {
   });
 });
 
+// Add this right before or after app.get('/health', ...)
+app.get('/', (req, res) => {
+  res.json({
+    service: 'Offline Payment Wallet Reconciliation Gateway',
+    status: 'online',
+    endpoints: {
+      health: '/health',
+      ledger: '/v1/ledger',
+      sync: 'POST /v1/sync',
+    },
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Reconciliation Gateway online on http://0.0.0.0:${PORT}`);
