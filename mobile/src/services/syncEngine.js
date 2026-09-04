@@ -1,6 +1,5 @@
-// src/services/syncEngine.js
-//import NetInfo from '@react-native-community/netinfo';
-import NetInfo from '@react-native-community/netinfo/lib/module';
+import NetInfo from '@react-native-community/netinfo';
+import * as SecureStore from 'expo-secure-store';
 import {
   getPendingSyncItems,
   markSyncItemCompleted,
@@ -8,14 +7,33 @@ import {
   getDBConnection,
 } from '../database/schema';
 
-// If testing with an Android Emulator, use 'http://10.0.2.2:3000/v1/sync'
-// If testing on a physical phone, replace with your laptop's local IPv4 (e.g. 'http://192.168.1.5:3000/v1/sync')
-const SYNC_GATEWAY_URL = 'http://10.151.56.94:3000/v1/sync';
+// ---------------------------------------------------------------------------
+// Production Gateway Configuration
+// ---------------------------------------------------------------------------
+export const DEFAULT_GATEWAY_URL = 'https://offline-wallet-gateway.onrender.com/v1/sync';
+const GATEWAY_STORAGE_KEY = 'wallet_gateway_endpoint';
+
+export const getStoredGatewayUrl = async () => {
+  try {
+    const saved = await SecureStore.getItemAsync(GATEWAY_STORAGE_KEY);
+    return saved || DEFAULT_GATEWAY_URL;
+  } catch {
+    return DEFAULT_GATEWAY_URL;
+  }
+};
+
+export const setStoredGatewayUrl = async (url) => {
+  try {
+    await SecureStore.setItemAsync(GATEWAY_STORAGE_KEY, url.trim());
+  } catch (e) {
+    console.warn('[SyncEngine] Failed to persist gateway url:', e);
+  }
+};
 
 let isSyncing = false;
 
 /**
- * Sends a single signed transaction payload from local SQLite to the backend
+ * Transmits a single offline-signed transaction to the central reconciliation server.
  */
 const postTransactionToServer = async (syncItem) => {
   const db = await getDBConnection();
@@ -25,16 +43,20 @@ const postTransactionToServer = async (syncItem) => {
   );
 
   if (!tx) {
-    throw new Error(`Transaction ${syncItem.transaction_id} not found in local ledger.`);
+    throw new Error(`Transaction ${syncItem.transaction_id} not found locally.`);
   }
 
-  /*
-   * Real Network Call (Active when your backend server is running)
-   */
+  const endpoint = await getStoredGatewayUrl();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000); // 8s timeout threshold
+
   try {
-    const response = await fetch(SYNC_GATEWAY_URL, {
+    const response = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
       body: JSON.stringify({
         transactionId: tx.transaction_id,
         sender: tx.sender,
@@ -45,24 +67,31 @@ const postTransactionToServer = async (syncItem) => {
         signature: tx.signature,
         senderPublicKey: tx.sender,
       }),
+      signal: controller.signal,
     });
 
+    clearTimeout(timeoutId);
+
+    const body = await response.json().catch(() => ({}));
+
+    // Server rejected with an error status
     if (!response.ok) {
-      const errorBody = await response.json().catch(() => ({}));
-      throw new Error(errorBody.message || `Server returned status: ${response.status}`);
+      const errorMsg = body.message || body.error || `HTTP ${response.status}`;
+      const err = new Error(errorMsg);
+      err.status = response.status;
+      err.data = body;
+      throw err;
     }
 
-    return await response.json();
-  } catch (netErr) {
-    // Fallback simulation: If the local server isn't running yet, simulate network settlement
-    console.warn(`[SyncEngine] Backend unreachable (${netErr.message}). Simulating offline settlement delay...`);
-    await new Promise((resolve) => setTimeout(resolve, 800));
-    return { success: true, simulated: true };
+    return body;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
   }
 };
 
 /**
- * Iterates through pending queue items sequentially in FIFO order
+ * Processes FIFO queue of pending transactions.
  */
 export const processSyncQueue = async () => {
   if (isSyncing) return;
@@ -70,36 +99,40 @@ export const processSyncQueue = async () => {
 
   try {
     const queue = await getPendingSyncItems();
-    if (!queue || queue.length === 0) {
-      isSyncing = false;
-      return;
-    }
-
-    console.log(`[SyncEngine] Processing ${queue.length} pending items...`);
+    if (!queue || queue.length === 0) return;
 
     for (const item of queue) {
       try {
         await postTransactionToServer(item);
+        // Settlement verified on central ledger -> mark complete locally
         await markSyncItemCompleted(item.sync_id, item.transaction_id);
-        console.log(`[SyncEngine] Successfully settled TX: ${item.transaction_id}`);
       } catch (err) {
-        console.error(`[SyncEngine] Failed syncing TX ${item.transaction_id}:`, err);
-        await markSyncItemFailed(item.sync_id, item.transaction_id, err.message);
+        // Handle permanent rejections (409 Conflict / Double Spend / Invalid Signature)
+        if (
+          err.status === 409 ||
+          err.message.includes('Invalid Nonce') ||
+          err.message.includes('DOUBLE_SPEND') ||
+          err.message.includes('signature')
+        ) {
+          console.error(`[SyncEngine] Permanent failure for TX ${item.transaction_id}: ${err.message}`);
+          await markSyncItemFailed(item.sync_id, item.transaction_id, err.message);
+        } else {
+          // Ephemeral network failure: leave in queue to retry on next reconnect
+          console.warn(`[SyncEngine] Network blip for TX ${item.transaction_id}, will retry later.`);
+          break; // Pause iteration until connectivity recovers
+        }
       }
     }
-  } catch (error) {
-    console.error('[SyncEngine] Error iterating queue:', error);
   } finally {
     isSyncing = false;
   }
 };
 
 /**
- * Initializes the global connectivity listener
+ * Subscribes to device network connectivity changes.
  */
 export const startSyncListener = () => {
   return NetInfo.addEventListener((state) => {
-    console.log(`[SyncEngine] Network State: ${state.isConnected ? 'ONLINE' : 'OFFLINE'}`);
     if (state.isConnected && state.isInternetReachable !== false) {
       processSyncQueue();
     }
