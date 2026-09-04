@@ -1,0 +1,13 @@
+{
+  "expo": {
+    "name": "Offline Payment Wallet",
+    "slug": "offline-payment-wallet",
+    "android": {
+      "package": "com.anonymous.offlinepaymentwallet"
+    },
+    "plugins": [
+      "expo-asset",
+      "expo-secure-store"
+    ]
+  }
+}
