@@ -1,48 +1,70 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { View, ActivityIndicator, StyleSheet, Alert } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
-import { createNativeStackNavigator } from '@react-navigation/native-stack';
-
-import HomeScreen from './src/screens/HomeScreen';
-import SendPaymentScreen from './src/screens/SendPaymentScreen';
-import ReceivePaymentScreen from './src/screens/ReceivePaymentScreen';
-import TransactionsScreen from './src/screens/TransactionsScreen';
 
 import { initDatabase, testDatabaseOperations } from './src/database/schema';
 import { initializeWalletIdentity } from './src/services/walletIdentity';
 import { startSyncListener } from './src/services/syncEngine';
 
-const Stack = createNativeStackNavigator();
+import AppNavigator from './src/navigations/AppNavigator';
 
 export default function App() {
   const [appReady, setAppReady] = useState(false);
+  const unsubscribeNetWatcherRef = useRef(null);
+  const isMountedRef = useRef(false);
 
   useEffect(() => {
+    isMountedRef.current = true;
+
     async function setup() {
       try {
-        // 1. Initialize SQLite Database & Tables
+        console.log('[INIT 1] Starting database initialization');
         await initDatabase();
+        console.log('[INIT 1] Database initialized');
 
-        // 2. Run diagnostic query checks
+        console.log('[INIT 2] Starting database tests');
         await testDatabaseOperations();
+        console.log('[INIT 2] Database tests completed');
 
-        // 3. Generate or retrieve hardware identity from Android Keystore & sync to SQLite
+        console.log('[INIT 3] Initializing wallet identity');
         const identity = await initializeWalletIdentity();
-        // Start listening for connectivity changes to drain sync queue
-        unsubscribeNetWatcher = startSyncListener();
-        console.log('✅ Identity loaded:', identity.walletAddress);
+        console.log('[INIT 3] Wallet identity initialized');
+
+        if (!isMountedRef.current) return;
+
+        console.log('[INIT 4] Starting sync listener');
+        const unsubscribe = startSyncListener();
+        console.log('[INIT 4] Sync listener started');
+
+        if (typeof unsubscribe === 'function') {
+          unsubscribeNetWatcherRef.current = unsubscribe;
+        }
+
+        console.log('Wallet identity loaded:', identity.walletAddress);
       } catch (err) {
-        console.error('Failed to initialize app services:', err);
-        Alert.alert('Initialization Error', 'Could not load local wallet data.');
+        console.error('[INIT ERROR]', err?.stack || err);
+
+        if (isMountedRef.current) {
+          Alert.alert(
+            'Initialization Error',
+            err?.message || 'Could not load local wallet data.'
+          );
+        }
       } finally {
-        setAppReady(true);
+        if (isMountedRef.current) {
+          setAppReady(true);
+        }
       }
     }
 
     setup();
+
     return () => {
-      if (unsubscribeNetWatcher) {
-        unsubscribeNetWatcher();
+      isMountedRef.current = false;
+
+      if (typeof unsubscribeNetWatcherRef.current === 'function') {
+        unsubscribeNetWatcherRef.current();
+        unsubscribeNetWatcherRef.current = null;
       }
     };
   }, []);
@@ -57,7 +79,7 @@ export default function App() {
 
   return (
     <NavigationContainer>
-      <Stack.Navigator
+      {/* <Stack.Navigator
         initialRouteName="Home"
         screenOptions={{
           headerStyle: { backgroundColor: '#0F172A' },
@@ -66,11 +88,33 @@ export default function App() {
           contentStyle: { backgroundColor: '#F8FAFC' },
         }}
       >
-        <Stack.Screen name="Home" component={HomeScreen} options={{ title: 'My Wallet' }} />
-        <Stack.Screen name="SendPayment" component={SendPaymentScreen} options={{ title: 'Send Payment' }} />
-        <Stack.Screen name="ReceivePayment" component={ReceivePaymentScreen} options={{ title: 'Receive Payment' }} />
-        <Stack.Screen name="Transactions" component={TransactionsScreen} options={{ title: 'Transaction History' }} />
-      </Stack.Navigator>
+        <Stack.Screen
+          name="Home"
+          component={HomeScreen}
+          options={{ title: 'My Wallet' }}
+        />
+        <Stack.Screen
+          name="SendPayment"
+          component={SendPaymentScreen}
+          options={{ title: 'Send Payment' }}
+        />
+        <Stack.Screen
+          name="ReceivePayment"
+          component={ReceivePaymentScreen}
+          options={{ title: 'Receive Payment' }}
+        />
+        <Stack.Screen
+          name="Transactions"
+          component={TransactionsScreen}
+          options={{ title: 'Transaction History' }}
+        />
+        <Stack.Screen
+          name="ReceiveQr"
+          component={ReceiveQrScreen}
+          options={{ title: 'Receive QR' }}
+        />
+      </Stack.Navigator> */}
+      <AppNavigator />
     </NavigationContainer>
   );
 }

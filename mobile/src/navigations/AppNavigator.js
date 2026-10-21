@@ -5,6 +5,9 @@ import HomeScreen from '../screens/HomeScreen';
 import SendPaymentScreen from '../screens/SendPaymentScreen';
 import ReceivePaymentScreen from '../screens/ReceivePaymentScreen';
 import TransactionScreens from '../screens/TransactionsScreen';
+import ReceiveQrScreen from '../screens/ReceiveQrScreen';
+import MintTokensScreen from '../screens/MintTokensScreen';
+import ScanPayScreen from '../screens/ScanPayScreen';
 
 const Stack = createNativeStackNavigator();
 
@@ -35,9 +38,25 @@ export default function AppNavigator() {
       />
 
       <Stack.Screen
+        name="ScanPay"
+        component={ScanPayScreen}
+        options={{ title: 'Scan & Pay' }}
+      />
+
+      <Stack.Screen
         name="ReceivePayment"
         component={ReceivePaymentScreen}
         options={{ title: 'Receive Payment' }}
+      />
+      <Stack.Screen
+        name="ReceiveQrScreen"
+        component={ReceiveQrScreen}
+        options={{ title: 'Receive QR' }}
+      />
+      <Stack.Screen 
+        name="MintTokens" 
+        component={MintTokensScreen} 
+        options={{ title: 'Mint Tokens' }} 
       />
     </Stack.Navigator>
   );
