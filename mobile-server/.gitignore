@@ -1,0 +1,4 @@
+node_modules
+keys/bank_keys.json
+db/store.json
+.env

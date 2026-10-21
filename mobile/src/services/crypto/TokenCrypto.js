@@ -2,7 +2,7 @@ import nacl from 'tweetnacl';
 import { decodeBase64, decodeUTF8 } from 'tweetnacl-util';
 
 // Hardcoded Bank Public Key generated in Step 1
-export const BANK_PUBLIC_KEY = 'JPK4IzOAFO2WZ/WuthBFZwxfaAMvKnlbZaZ2Wvy8/Fw=';//after testing change it to the real and in .env file
+export const BANK_PUBLIC_KEY = 'cIbsgiuXwjmfIvmUxN5POUOCwwwfXTWcF/xG2YhFrT4=';//after testing change it to the real and in .env file
 
 
 export const verifyBankToken = (tokenData) => {

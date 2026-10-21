@@ -13,7 +13,7 @@ import {
 import { verifyBankToken } from '../services/crypto/TokenCrypto';
 import { saveMintedToken } from '../storage/TokenLedgerService';
 
-const SERVER_BASE_URL = 'http://10.0.2.2:4000'; // Replace with your production or local machine IP
+const SERVER_BASE_URL = 'http://localhost:4000'; // Replace with your production or local machine IP
 
 export default function MintTokensScreen({ navigation, route }) {
   const maxFiat = route.params?.maxFiat ?? 2500.0;
