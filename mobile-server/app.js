@@ -29,6 +29,28 @@ app.get('/api/wallet/user/:userId', (req, res) => {
   res.json({ userId: req.params.userId, fiatBalance: user.fiatBalance });
 });
 
+// GET /api/bank/balance/:userId
+app.get('/api/bank/balance/:userId', (req, res) => {
+  const { userId } = req.params;
+  const db = getDB();
+
+  // If user does not exist in store, bootstrap them with a default balance
+  if (!db.users[userId]) {
+    db.users[userId] = { fiatBalance: 5000.0 };
+    saveDB(db);
+  }
+
+  const user = db.users[userId];
+
+  return res.status(200).json({
+    success: true,
+    userId,
+    fiatBalance: user.fiatBalance,
+    currency: 'INR',
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // Minting & Reconciliation
 app.post('/api/wallet/mint-request', mintTokens);
 app.post('/api/wallet/reconcile', reconcileTokens);

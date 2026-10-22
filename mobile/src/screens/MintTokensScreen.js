@@ -13,11 +13,13 @@ import {
 import { verifyBankToken } from '../services/crypto/TokenCrypto';
 import { saveMintedToken } from '../storage/TokenLedgerService';
 
-const SERVER_BASE_URL = 'http://localhost:4000'; // Replace with your production or local machine IP
+const SERVER_BASE_URL = 'https://offline-payment-wallet-2.onrender.com'; // Replace with your production or local machine IP
 
 export default function MintTokensScreen({ navigation, route }) {
   const maxFiat = route.params?.maxFiat ?? 2500.0;
   const userId = route.params?.userId || 'merchant_9876';
+  const [currentFiat, setCurrentFiat] = useState(route.params?.fiatBalance ?? 0);
+  const onMintSuccess = route.params?.onMintSuccess;
 
   const [amount, setAmount] = useState('500');
   const [loading, setLoading] = useState(false);
@@ -33,8 +35,11 @@ export default function MintTokensScreen({ navigation, route }) {
       return;
     }
 
-    if (numericAmount > maxFiat) {
-      Alert.alert('Insufficient Balance', 'Requested amount exceeds your available bank fiat balance.');
+    if (numericAmount > currentFiat) {
+      Alert.alert(
+        'Insufficient Balance',
+        `Requested amount (₹${numericAmount}) exceeds your available bank balance (₹${Number(currentFiat).toFixed(2)}).`
+      );
       return;
     }
 
@@ -70,13 +75,17 @@ export default function MintTokensScreen({ navigation, route }) {
 
       // 3. Atomically write minted tokens to the local encrypted SQLite DB
       await saveMintedToken(data.tokenData);
+      setCurrentFiat((prev) => Math.max(0, prev - numericAmount));
+      if (onMintSuccess) {
+        onMintSuccess(numericAmount);
+      }
 
       setLoading(false);
       Alert.alert(
         'Conversion Successful',
-        `₹${numericAmount} has been minted into offline digital tokens and secured in your wallet.`,
+        `₹${numericAmount.toFixed(2)} minted and stored in offline vault.`,
         [{ text: 'Back to Wallet', onPress: () => navigation.goBack() }]
-      );
+      ); 
     } catch (err) {
       setLoading(false);
       setStatusMessage('');

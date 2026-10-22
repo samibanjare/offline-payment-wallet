@@ -17,12 +17,17 @@ import { initWalletDB } from '../storage/WalletDatabase';
 
 export default function HomeScreen({ navigation }) {
   const [offlineTokenBalance, setOfflineTokenBalance] = useState(0);
-  const [fiatBalance, setFiatBalance] = useState(2500.0); // Fetched from bank backend
+  // const [fiatBalance, setFiatBalance] = useState(2500.0); // Fetched from bank backend
+  const [fiatBalance, setFiatBalance] = useState(null);
+  const [isLoadingBankBalance, setIsLoadingBankBalance] = useState(false);
   const [recentTransactions, setRecentTransactions] = useState([]);
   const [pendingSyncCount, setPendingSyncCount] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isOnline, setIsOnline] = useState(true);
+
+  const USER_ID = 'merchant_9876';
+  const SERVER_BASE_URL = 'https://offline-payment-wallet-2.onrender.com';
 
   // Monitor network status for auto-reconciliation
   useEffect(() => {
@@ -35,6 +40,40 @@ export default function HomeScreen({ navigation }) {
     });
     return () => unsubscribe();
   }, []);
+
+  const fetchBankBalance = async () => {
+    setIsLoadingBankBalance(true);
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+      const response = await fetch(
+        `${SERVER_BASE_URL}/api/bank/balance/${USER_ID}`,
+        { signal: controller.signal }
+      );
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`Bank API failed: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      // Read fiatBalance from backend response with fallback to balance
+      const balanceValue = data.fiatBalance ?? data.balance;
+
+      if (typeof balanceValue !== 'number' || !Number.isFinite(balanceValue)) {
+        throw new Error('Invalid bank balance returned by API');
+      }
+
+      setFiatBalance(balanceValue);
+    } catch (error) {
+      console.error('Failed to fetch bank balance:', error.message);
+    } finally {
+      setIsLoadingBankBalance(false);
+    }
+  };
 
   const loadWalletData = async () => {
     try {
@@ -64,6 +103,7 @@ export default function HomeScreen({ navigation }) {
   useFocusEffect(
     useCallback(() => {
       loadWalletData();
+      fetchBankBalance();
     }, [])
   );
 
@@ -80,8 +120,8 @@ export default function HomeScreen({ navigation }) {
     if (isSyncing) return;
     setIsSyncing(true);
     try {
-      const res = await syncOfflineTokensWithBank('merchant_9876');
-      if (res.synced && res.settledCount > 0) {
+      const res = await syncOfflineTokensWithBank(USER_ID);
+      if (res?.synced && res?.settledCount > 0) {
         setFiatBalance(res.newBalance);
         await loadWalletData();
       }
@@ -131,15 +171,36 @@ export default function HomeScreen({ navigation }) {
 
           <View style={styles.balanceCol}>
             <Text style={styles.balanceSublabel}>Bank Account</Text>
-            <Text style={styles.fiatAmount}>₹{fiatBalance.toFixed(2)}</Text>
-            <Text style={styles.balanceHint}>Actual money (Online)</Text>
+            <Text style={styles.fiatAmount}>
+              {isLoadingBankBalance && fiatBalance === null
+                ? 'Loading...'
+                : fiatBalance !== null
+                ? `₹${fiatBalance.toFixed(2)}`
+                : 'Unavailable'}
+            </Text>
+
+            <Text style={styles.balanceHint}>
+              {isLoadingBankBalance
+                ? 'Fetching latest balance...'
+                : 'Actual money (Online)'}
+            </Text>
           </View>
         </View>
 
         {/* Action to Request Bank Token Conversion */}
         <TouchableOpacity
           style={styles.convertBtn}
-          onPress={() => navigation.navigate('MintTokens', { maxFiat: fiatBalance })}
+          disabled={fiatBalance === null || fiatBalance <= 0}
+          onPress={() =>
+            navigation.navigate('MintTokens', {
+              userId: USER_ID,
+              fiatBalance: fiatBalance, // The exact value already loaded on HomeScreen
+              onMintSuccess: (deductedAmount) => {
+                // Immediately subtract from HomeScreen state
+                setFiatBalance((prev) => Math.max(0, (prev || 0) - deductedAmount));
+              },
+            })
+          }
         >
           <Text style={styles.convertBtnText}>+ Convert Fiat to Digital Tokens</Text>
         </TouchableOpacity>
@@ -158,13 +219,10 @@ export default function HomeScreen({ navigation }) {
         <TouchableOpacity
           style={[styles.actionBtn, { backgroundColor: '#10B981' }]}
           onPress={() => {
-  console.log(
-    'Navigator route names:',
-    navigation.getState().routeNames
-  );
-
-  navigation.navigate('ReceiveQrScreen');
-}}
+            const availableRoutes = navigation.getState()?.routeNames || [];
+            const targetRoute = availableRoutes.includes('ReceiveQrScreen') ? 'ReceiveQrScreen' : 'ReceiveQr';
+            navigation.navigate(targetRoute, { receiverId: USER_ID });
+          }}
         >
           <Text style={styles.actionBtnIcon}>📡</Text>
           <Text style={styles.actionBtnText}>Receive via BLE</Text>

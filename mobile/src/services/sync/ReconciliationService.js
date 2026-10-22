@@ -1,7 +1,7 @@
 import NetInfo from '@react-native-community/netinfo';
 import { initWalletDB } from '../../storage/WalletDatabase';
 
-const SERVER_BASE_URL = 'http://10.0.2.2:4000'; // Android emulator localhost alias
+const SERVER_BASE_URL = 'https://offline-payment-wallet-2.onrender.com'; // Android emulator localhost alias
 
 /**
  * Checks connectivity and syncs all offline-collected tokens to the bank
