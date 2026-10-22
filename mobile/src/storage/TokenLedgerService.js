@@ -13,6 +13,7 @@ export const getSpendableBalance = async () => {
 
 /**
  * Save newly minted bank tokens from the server
+ * Note: Since minting occurs directly with the cloud bank, its sync_status is 'SETTLED'
  */
 export const saveMintedToken = async (tokenData) => {
   const db = await initWalletDB();
@@ -25,8 +26,8 @@ export const saveMintedToken = async (tokenData) => {
   );
 
   db.execute(
-    `INSERT INTO transactions (txnId, type, amount, counterpartyId, timestamp, status)
-     VALUES (?, 'MINT', ?, 'BANK_ADMIN', ?, 'SUCCESS');`,
+    `INSERT INTO transactions (txnId, type, amount, counterpartyId, timestamp, status, sync_status, retryCount)
+     VALUES (?, 'MINT', ?, 'BANK_ADMIN', ?, 'SUCCESS', 'SETTLED', 0);`,
     [tokenId, amount, Date.now()]
   );
 };
@@ -69,6 +70,7 @@ export const lockTokensForPayment = async (requiredAmount, sessionId) => {
 
 /**
  * Step 2: Receiver ACK confirmed -> Mark locked tokens as SPENT
+ * Queued locally with sync_status = 'PENDING'
  */
 export const commitSpentTokens = async (sessionId, receiverId, ackReceipt) => {
   const db = await initWalletDB();
@@ -79,8 +81,8 @@ export const commitSpentTokens = async (sessionId, receiverId, ackReceipt) => {
   );
 
   db.execute(
-    `INSERT INTO transactions (txnId, type, amount, counterpartyId, timestamp, status, rawAck)
-     VALUES (?, 'SENT', ?, ?, ?, 'COMMITTED', ?);`,
+    `INSERT INTO transactions (txnId, type, amount, counterpartyId, timestamp, status, sync_status, retryCount, rawAck)
+     VALUES (?, 'SENT', ?, ?, ?, 'COMMITTED', 'PENDING', 0, ?);`,
     [ackReceipt.txnId, ackReceipt.amount, receiverId, Date.now(), JSON.stringify(ackReceipt)]
   );
 };
@@ -98,6 +100,7 @@ export const rollbackLockedTokens = async (sessionId) => {
 
 /**
  * Receiver Side: Save incoming validated token from BLE
+ * Queued locally with sync_status = 'PENDING'
  */
 export const recordReceivedToken = async (tokenData, senderId, ackData) => {
   const db = await initWalletDB();
@@ -110,8 +113,19 @@ export const recordReceivedToken = async (tokenData, senderId, ackData) => {
   );
 
   db.execute(
-    `INSERT INTO transactions (txnId, type, amount, counterpartyId, timestamp, status, rawAck)
-     VALUES (?, 'RECEIVED', ?, ?, ?, 'COMMITTED', ?);`,
+    `INSERT INTO transactions (txnId, type, amount, counterpartyId, timestamp, status, sync_status, retryCount, rawAck)
+     VALUES (?, 'RECEIVED', ?, ?, ?, 'COMMITTED', 'PENDING', 0, ?);`,
     [tokenId, amount, senderId, Date.now(), JSON.stringify(ackData)]
   );
+};
+
+/**
+ * Helper: Fetch pending items count for the outbox UI badge
+ */
+export const getPendingOutboxCount = async () => {
+  const db = await initWalletDB();
+  const result = db.execute(`
+    SELECT COUNT(*) as pendingCount FROM transactions WHERE sync_status = 'PENDING';
+  `);
+  return result.rows?._array[0]?.pendingCount || 0;
 };

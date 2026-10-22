@@ -2,16 +2,30 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 
+require('dotenv').config();
+const { connectDB } = require('./utils/db');
+
 const { mintTokens } = require('./controllers/mintController');
 const { reconcileTokens } = require('./controllers/reconcileController');
 const { getBankPublicKey } = require('./utils/keyManager');
 const { getDB } = require('./utils/db');
 
 const app = express();
+const path = require('path');
 
 app.use(cors());
 app.use(express.json());
 app.use(morgan('dev'));
+
+connectDB();
+
+const adminRoutes = require('./routes/admin');
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(adminRoutes);
+
+app.get('/admin', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+});
 
 // Health check
 app.get('/api/health', (req, res) => {

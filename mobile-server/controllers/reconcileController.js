@@ -1,76 +1,138 @@
 const nacl = require('tweetnacl');
 const { decodeBase64, decodeUTF8 } = require('tweetnacl-util');
 const { getBankPublicKey } = require('../utils/keyManager');
-const { getDB, saveDB } = require('../utils/db');
+const { User, RedeemedToken, createOrUpdateUser, recordLog } = require('../utils/db');
 
-exports.reconcileTokens = (req, res) => {
-  const { receiverId, submissions } = req.body;
+exports.reconcileTokens = async (req, res) => {
+  const { receiverId, submissions = [], auditBatch = [] } = req.body;
+  const clientIp = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
 
-  if (!receiverId || !Array.isArray(submissions) || submissions.length === 0) {
-    return res.status(400).json({ success: false, error: 'Invalid submission format' });
+  if (!receiverId) {
+    return res.status(400).json({ success: false, error: 'receiverId is required' });
   }
 
-  const db = getDB();
-  if (!db.users[receiverId]) {
-    db.users[receiverId] = { fiatBalance: 0.0 };
+  // Allow call if there is at least an auditBatch OR submissions to reconcile
+  if (!Array.isArray(submissions) || !Array.isArray(auditBatch)) {
+    return res.status(400).json({ success: false, error: 'Invalid payload structures' });
   }
 
-  const bankPublicKeyBytes = decodeBase64(getBankPublicKey());
-  const settledTokenIds = [];
-  const rejectedTokenIds = [];
-  let totalCredited = 0;
-
-  for (const item of submissions) {
-    const { tokenData, ackReceipt } = item;
-    const { tokenId, amount, issuedTo, issuedAt, expiresAt, bankSignature } = tokenData;
-
-    // Check 1: Has this token already been redeemed?
-    if (db.redeemedTokens[tokenId]) {
-      rejectedTokenIds.push({ tokenId, reason: 'DOUBLE_SPEND_DETECTED_ALREADY_REDEEMED' });
-      continue;
-    }
-
-    // Check 2: Expiry check
-    if (Date.now() > expiresAt) {
-      rejectedTokenIds.push({ tokenId, reason: 'TOKEN_EXPIRED' });
-      continue;
-    }
-
-    // Check 3: Cryptographic Signature Verification
-    const rawToken = { tokenId, issuedTo, amount, issuedAt, expiresAt };
-    const messageBytes = decodeUTF8(JSON.stringify(rawToken));
-    const signatureBytes = decodeBase64(bankSignature);
-
-    const isValid = nacl.sign.detached.verify(messageBytes, signatureBytes, bankPublicKeyBytes);
-    if (!isValid) {
-      rejectedTokenIds.push({ tokenId, reason: 'INVALID_BANK_SIGNATURE' });
-      continue;
-    }
-
-    // Accept token: Burn token & prepare credit
-    db.redeemedTokens[tokenId] = {
-      settledBy: receiverId,
-      settledAt: Date.now(),
-      amount: Number(amount),
-      receipt: ackReceipt || null,
-    };
-
-    settledTokenIds.push(tokenId);
-    totalCredited += Number(amount);
+  if (submissions.length === 0 && auditBatch.length === 0) {
+    return res.status(400).json({ success: false, error: 'No submissions or audit records provided' });
   }
 
-  // Credit receiver account
-  db.users[receiverId].fiatBalance += totalCredited;
-  saveDB(db);
+  try {
+    const receiver = await createOrUpdateUser(receiverId);
 
-  console.log(`[RECONCILE] Credited ₹${totalCredited} to ${receiverId}. Settled count: ${settledTokenIds.length}`);
+    // 1. Ingest Offline Outbox Audit Logs (Both SENT & RECEIVED records)
+    if (auditBatch.length > 0) {
+      for (const item of auditBatch) {
+        await recordLog(
+          receiverId,
+          item.type === 'SENT' ? 'OFFLINE_PAYMENT_SENT' : 'OFFLINE_PAYMENT_RECEIVED',
+          Number(item.amount) || 0,
+          item.status === 'COMMITTED' ? 'SUCCESS' : 'FAILED',
+          { txnId: item.txnId, counterparty: item.counterpartyId },
+          clientIp
+        );
+      }
+    }
 
-  return res.status(200).json({
-    success: true,
-    receiverId,
-    totalCredited,
-    newFiatBalance: db.users[receiverId].fiatBalance,
-    settledTokenIds,
-    rejectedTokenIds,
-  });
+    // 2. Process Token Redemptions (Fiat conversion)
+    const bankPublicKeyBytes = decodeBase64(getBankPublicKey());
+    const settledTokenIds = [];
+    const rejectedTokenIds = [];
+    let totalCredited = 0;
+
+    for (const item of submissions) {
+      const { tokenData, ackReceipt } = item;
+      const { tokenId, amount, issuedTo, issuedAt, expiresAt, bankSignature } = tokenData;
+
+      // Check A: Double-Spend Check
+      const alreadyRedeemed = await RedeemedToken.findOne({ tokenId });
+      if (alreadyRedeemed) {
+        rejectedTokenIds.push({ tokenId, reason: 'DOUBLE_SPEND_DETECTED_ALREADY_REDEEMED' });
+        await recordLog(
+          receiverId,
+          'RECONCILE_REJECTED',
+          Number(amount),
+          'FAILED',
+          `Double spend attempt on ${tokenId}`,
+          clientIp
+        );
+        continue;
+      }
+
+      // Check B: Expiry Check
+      if (Date.now() > expiresAt) {
+        rejectedTokenIds.push({ tokenId, reason: 'TOKEN_EXPIRED' });
+        await recordLog(
+          receiverId,
+          'RECONCILE_REJECTED',
+          Number(amount),
+          'FAILED',
+          `Expired token submission on ${tokenId}`,
+          clientIp
+        );
+        continue;
+      }
+
+      // Check C: Cryptographic Signature Verification
+      const rawToken = { tokenId, issuedTo, amount, issuedAt, expiresAt };
+      const messageBytes = decodeUTF8(JSON.stringify(rawToken));
+      const signatureBytes = decodeBase64(bankSignature);
+
+      const isValid = nacl.sign.detached.verify(messageBytes, signatureBytes, bankPublicKeyBytes);
+      if (!isValid) {
+        rejectedTokenIds.push({ tokenId, reason: 'INVALID_BANK_SIGNATURE' });
+        await recordLog(
+          receiverId,
+          'RECONCILE_REJECTED',
+          Number(amount),
+          'FAILED',
+          `Invalid signature on ${tokenId}`,
+          clientIp
+        );
+        continue;
+      }
+
+      // Record Redeemed Token in MongoDB
+      await RedeemedToken.create({
+        tokenId,
+        settledBy: receiverId,
+        amount: Number(amount),
+        settledAt: Date.now(),
+        rawAck: ackReceipt || null,
+      });
+
+      settledTokenIds.push(tokenId);
+      totalCredited += Number(amount);
+    }
+
+    // 3. Credit Fiat Balance if any tokens were redeemed
+    if (totalCredited > 0) {
+      receiver.fiatBalance += totalCredited;
+      await receiver.save();
+      await recordLog(
+        receiverId,
+        'RECONCILE_SUCCESS',
+        totalCredited,
+        'SUCCESS',
+        { settledCount: settledTokenIds.length },
+        clientIp
+      );
+    }
+
+    return res.status(200).json({
+      success: true,
+      receiverId,
+      totalCredited,
+      newFiatBalance: receiver.fiatBalance,
+      settledTokenIds,
+      rejectedTokenIds,
+      auditProcessed: auditBatch.length,
+    });
+  } catch (err) {
+    console.error('Reconciliation error:', err);
+    return res.status(500).json({ success: false, error: err.message });
+  }
 };

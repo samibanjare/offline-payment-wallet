@@ -14,6 +14,7 @@ import NetInfo from '@react-native-community/netinfo';
 import { getSpendableBalance } from '../storage/TokenLedgerService';
 import { syncOfflineTokensWithBank } from '../services/sync/ReconciliationService';
 import { initWalletDB } from '../storage/WalletDatabase';
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 
 export default function HomeScreen({ navigation }) {
   const [offlineTokenBalance, setOfflineTokenBalance] = useState(0);
@@ -212,7 +213,11 @@ export default function HomeScreen({ navigation }) {
           style={[styles.actionBtn, { backgroundColor: '#00BAF2' }]}
           onPress={() => navigation.navigate('ScanPay')}
         >
-          <Text style={styles.actionBtnIcon}>📷</Text>
+          <Text style={styles.actionBtnIcon}><MaterialCommunityIcons
+            name="qrcode-scan"
+            size={24}
+            color="#000000"
+          /></Text>
           <Text style={styles.actionBtnText}>Scan QR & Pay</Text>
         </TouchableOpacity>
 
@@ -224,7 +229,13 @@ export default function HomeScreen({ navigation }) {
             navigation.navigate(targetRoute, { receiverId: USER_ID });
           }}
         >
-          <Text style={styles.actionBtnIcon}>📡</Text>
+          <Text style={styles.actionBtnIcon}>
+            <MaterialCommunityIcons
+              name="bluetooth"
+              size={24}
+              color="#000000"
+            />
+          </Text>
           <Text style={styles.actionBtnText}>Receive via BLE</Text>
         </TouchableOpacity>
       </View>

@@ -14,7 +14,7 @@ export const initWalletDB = async () => {
     encryptionKey: encryptionKey,
   });
 
-  // Table 1: Tokens (Minted or Received)
+  // Table 1: Tokens (Minted, Received, Spent, or Reconciled)
   dbInstance.execute(`
     CREATE TABLE IF NOT EXISTS tokens (
       tokenId TEXT PRIMARY KEY,
@@ -24,12 +24,12 @@ export const initWalletDB = async () => {
       expiresAt INTEGER NOT NULL,
       bankSignature TEXT NOT NULL,
       bankPublicKey TEXT NOT NULL,
-      status TEXT CHECK(status IN ('AVAILABLE', 'LOCKED_PENDING', 'SPENT', 'RECEIVED')) NOT NULL DEFAULT 'AVAILABLE',
+      status TEXT CHECK(status IN ('AVAILABLE', 'LOCKED_PENDING', 'SPENT', 'RECEIVED', 'SETTLED')) NOT NULL DEFAULT 'AVAILABLE',
       txSessionId TEXT
     );
   `);
 
-  // Table 2: Audit Ledger & Receipts
+  // Table 2: Audit Ledger & Receipts with Sync Outbox State
   dbInstance.execute(`
     CREATE TABLE IF NOT EXISTS transactions (
       txnId TEXT PRIMARY KEY,
@@ -38,9 +38,24 @@ export const initWalletDB = async () => {
       counterpartyId TEXT NOT NULL,
       timestamp INTEGER NOT NULL,
       status TEXT NOT NULL,
+      sync_status TEXT CHECK(sync_status IN ('PENDING', 'SYNCING', 'SETTLED')) NOT NULL DEFAULT 'PENDING',
+      retryCount INTEGER NOT NULL DEFAULT 0,
       rawAck TEXT
     );
   `);
+
+  // Schema Migrations (Ensures existing DB files get new columns without data loss)
+  try {
+    dbInstance.execute(`ALTER TABLE transactions ADD COLUMN sync_status TEXT DEFAULT 'PENDING';`);
+  } catch (e) {
+    // Column already exists, safe to ignore
+  }
+
+  try {
+    dbInstance.execute(`ALTER TABLE transactions ADD COLUMN retryCount INTEGER DEFAULT 0;`);
+  } catch (e) {
+    // Column already exists, safe to ignore
+  }
 
   return dbInstance;
 };

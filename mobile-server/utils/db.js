@@ -1,35 +1,69 @@
-const fs = require('fs');
-const path = require('path');
+const mongoose = require('mongoose');
+const { User, MintedToken, RedeemedToken, ActivityLog } = require('../models');
 
-const DB_DIR = path.join(__dirname, '../db');
-const DB_FILE = path.join(DB_DIR, 'store.json');
+const MONGODB_URI = process.env.MONGODB_URI;
 
-const defaultState = {
-  users: {
-    merchant_9876: { fiatBalance: 5000.0 },
-    sender_001: { fiatBalance: 10000.0 },
-  },
-  mintedTokens: {},   // tokenId -> tokenData
-  redeemedTokens: {}, // tokenId -> settlementMeta
+const connectDB = async () => {
+  if (!MONGODB_URI) {
+    console.warn('⚠️ MONGODB_URI not found in environment. Please set it in .env');
+    return;
+  }
+
+  try {
+    await mongoose.connect(MONGODB_URI);
+    console.log('✅ Connected to MongoDB Atlas');
+
+    // Seed default users if the collection is empty
+    const count = await User.countDocuments();
+    if (count === 0) {
+      await User.create([
+        { userId: 'merchant_9876', name: 'Coffee Shop Merchant', role: 'MERCHANT', fiatBalance: 5000.0 },
+        { userId: 'sender_001', name: 'Alice Customer', role: 'USER', fiatBalance: 10000.0 },
+      ]);
+      console.log('🌱 Default users seeded to MongoDB');
+    }
+  } catch (err) {
+    console.error('❌ MongoDB Connection Error:', err.message);
+  }
 };
 
-function getDB() {
-  if (!fs.existsSync(DB_DIR)) {
-    fs.mkdirSync(DB_DIR, { recursive: true });
+// Helper: Find or initialize a user with starting balance
+const createOrUpdateUser = async (userId, name = 'App User', role = 'USER', defaultBalance = 5000.0) => {
+  let user = await User.findOne({ userId });
+  if (!user) {
+    user = await User.create({
+      userId,
+      name,
+      role,
+      fiatBalance: defaultBalance,
+    });
   }
-  if (!fs.existsSync(DB_FILE)) {
-    fs.writeFileSync(DB_FILE, JSON.stringify(defaultState, null, 2));
-    return defaultState;
-  }
+  return user;
+};
+
+// Helper: Write audit/activity log entry to MongoDB
+const recordLog = async (userId, action, amount = 0.0, status = 'SUCCESS', details = null, ip = null) => {
   try {
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
+    await ActivityLog.create({
+      userId,
+      action,
+      amount,
+      status,
+      details,
+      ipAddress: ip,
+      timestamp: Date.now(),
+    });
   } catch (err) {
-    return defaultState;
+    console.error('Failed to write activity log:', err.message);
   }
-}
+};
 
-function saveDB(data) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-}
-
-module.exports = { getDB, saveDB };
+module.exports = {
+  connectDB,
+  User,
+  MintedToken,
+  RedeemedToken,
+  ActivityLog,
+  createOrUpdateUser,
+  recordLog,
+};
