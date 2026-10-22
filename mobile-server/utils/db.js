@@ -1,16 +1,17 @@
 const mongoose = require('mongoose');
 const { User, MintedToken, RedeemedToken, ActivityLog } = require('../models');
 
-const MONGODB_URI = process.env.MONGODB_URI;
-
+// ✅ Read process.env directly inside the function
 const connectDB = async () => {
-  if (!MONGODB_URI) {
-    console.warn('⚠️ MONGODB_URI not found in environment. Please set it in .env');
+  const uri = process.env.MONGODB_URI;
+
+  if (!uri) {
+    console.warn('⚠️ MONGODB_URI not found in environment. Please set it in Render.');
     return;
   }
 
   try {
-    await mongoose.connect(MONGODB_URI);
+    await mongoose.connect(uri);
     console.log('✅ Connected to MongoDB Atlas');
 
     // Seed default users if the collection is empty
