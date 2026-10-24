@@ -17,6 +17,9 @@ const ActivityLogSchema = new mongoose.Schema(
         'RECONCILE_REJECTED',
         'BALANCE_CHECK',
         'USER_REGISTERED',
+        'OFFLINE_PAYMENT_SENT',     // <-- Added
+        'OFFLINE_PAYMENT_RECEIVED', // <-- Added
+        'ADMIN_CREDIT',             // <-- Added
       ],
     },
     amount: {

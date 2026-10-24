@@ -1,23 +1,28 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { View, Text, StyleSheet, FlatList, TouchableOpacity, RefreshControl } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import { initWalletDB } from '../storage/WalletDatabase';
+import { getUniqueDeviceId } from '../services/DeviceIdentityService';
 
-const STATUS_FILTERS = ['All', 'Committed', 'Received', 'Mint', 'Settled'];
+const STATUS_FILTERS = ['All', 'Sent', 'Received', 'Mint', 'Settled'];
 
 export default function TransactionsScreen() {
   const [selectedFilter, setSelectedFilter] = useState('All');
   const [transactions, setTransactions] = useState([]);
   const [refreshing, setRefreshing] = useState(false);
+  const [currentDeviceId, setCurrentDeviceId] = useState(null);
+
+  useEffect(() => {
+    getUniqueDeviceId().then((id) => setCurrentDeviceId(id));
+  }, []);
 
   const fetchTransactions = async (filterName) => {
     try {
       const db = await initWalletDB();
       let query = `SELECT * FROM transactions`;
-      let params = [];
 
-      if (filterName === 'Committed') {
-        query += ` WHERE status = 'COMMITTED' AND type = 'SENT'`;
+      if (filterName === 'Sent') {
+        query += ` WHERE type = 'SENT'`;
       } else if (filterName === 'Received') {
         query += ` WHERE type = 'RECEIVED'`;
       } else if (filterName === 'Mint') {
@@ -28,8 +33,25 @@ export default function TransactionsScreen() {
 
       query += ` ORDER BY timestamp DESC;`;
 
-      const result = db.execute(query, params);
-      setTransactions(result?.rows?._array || []);
+      let rows = [];
+
+      // Safe multi-version Expo SQLite query executor
+      if (typeof db.getAllAsync === 'function') {
+        rows = await db.getAllAsync(query);
+      } else if (typeof db.getAllSync === 'function') {
+        rows = db.getAllSync(query);
+      } else if (typeof db.execute === 'function') {
+        const result = db.execute(query);
+        rows = result?.rows?._array || result?.rows || [];
+      } else if (typeof db.transaction === 'function') {
+        rows = await new Promise((resolve) => {
+          db.transaction((tx) => {
+            tx.executeSql(query, [], (_, { rows: { _array } }) => resolve(_array || []));
+          });
+        });
+      }
+
+      setTransactions(Array.isArray(rows) ? rows : []);
     } catch (error) {
       console.error('Failed to query transactions from SQLite:', error);
       setTransactions([]);
@@ -52,6 +74,7 @@ export default function TransactionsScreen() {
     if (status === 'SETTLED') return '#10B981';
     if (type === 'MINT') return '#0284C7';
     if (status === 'COMMITTED') return '#3B82F6';
+    if (status === 'FAILED') return '#EF4444';
     return '#F59E0B';
   };
 
@@ -75,7 +98,7 @@ export default function TransactionsScreen() {
       {/* Offline SQLite Transaction List */}
       <FlatList
         data={transactions}
-        keyExtractor={(item) => item.txnId}
+        keyExtractor={(item, index) => String(item.txnId || item.tokenId || `tx_${index}`)}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
         renderItem={({ item }) => {
           const isSent = item.type === 'SENT';
@@ -83,7 +106,7 @@ export default function TransactionsScreen() {
           const isReceived = item.type === 'RECEIVED';
 
           const displayDate = item.timestamp
-            ? new Date(item.timestamp).toLocaleString([], {
+            ? new Date(Number(item.timestamp)).toLocaleString([], {
                 month: 'short',
                 day: 'numeric',
                 hour: '2-digit',
@@ -91,9 +114,13 @@ export default function TransactionsScreen() {
               })
             : 'Pending timestamp';
 
-          let titleText = `To: ${item.counterpartyId}`;
-          if (isReceived) titleText = `From: ${item.counterpartyId}`;
-          if (isMint) titleText = 'Bank Token Mint';
+          // Resolve counterparty display
+          let titleText = `To: ${item.counterpartyId || 'Unknown Device'}`;
+          if (isReceived) {
+            titleText = `From: ${item.counterpartyId || 'Nearby Peer'}`;
+          } else if (isMint) {
+            titleText = 'Bank Token Mint';
+          }
 
           return (
             <View style={styles.txRow}>
@@ -121,7 +148,7 @@ export default function TransactionsScreen() {
                   </Text>
                   <Text style={styles.txDate}>{displayDate}</Text>
                   <Text style={styles.txId} numberOfLines={1} ellipsizeMode="middle">
-                    ID: {item.txnId}
+                    {item.txnId ? `TXN: ${item.txnId}` : item.tokenId ? `TOKEN: ${item.tokenId}` : ''}
                   </Text>
                 </View>
               </View>
@@ -138,13 +165,13 @@ export default function TransactionsScreen() {
                   ]}
                 >
                   {isReceived ? '+₹' : isMint ? '₹' : '-₹'}
-                  {Number(item.amount).toFixed(2)}
+                  {Number(item.amount || 0).toFixed(2)}
                 </Text>
 
                 <View
                   style={[
                     styles.statusBadge,
-                    { backgroundColor: `${getStatusColor(item.status, item.type)}15` },
+                    { backgroundColor: `${getStatusColor(item.status, item.type)}18` },
                   ]}
                 >
                   <Text
@@ -153,7 +180,7 @@ export default function TransactionsScreen() {
                       { color: getStatusColor(item.status, item.type) },
                     ]}
                   >
-                    {item.status}
+                    {item.status || 'RECORDED'}
                   </Text>
                 </View>
               </View>
@@ -163,7 +190,7 @@ export default function TransactionsScreen() {
         ListEmptyComponent={
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyText}>
-              No {selectedFilter.toLowerCase()} transactions found in local vault.
+              No {selectedFilter.toLowerCase()} records found in local vault.
             </Text>
           </View>
         }

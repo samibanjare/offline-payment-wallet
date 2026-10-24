@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -12,13 +12,13 @@ import {
 } from 'react-native';
 import { verifyBankToken } from '../services/crypto/TokenCrypto';
 import { saveMintedToken } from '../storage/TokenLedgerService';
+import { getUniqueDeviceId } from '../services/DeviceIdentityService';
 
-const SERVER_BASE_URL = 'https://offline-payment-wallet-2.onrender.com'; // Replace with your production or local machine IP
+const SERVER_BASE_URL = 'https://offline-payment-wallet-2.onrender.com';
 
 export default function MintTokensScreen({ navigation, route }) {
-  const maxFiat = route.params?.maxFiat ?? 2500.0;
-  const userId = route.params?.userId || 'merchant_9876';
-  const [currentFiat, setCurrentFiat] = useState(route.params?.fiatBalance ?? 0);
+  const [userId, setUserId] = useState(route.params?.userId || null);
+  const [currentFiat, setCurrentFiat] = useState(Number(route.params?.fiatBalance ?? 0));
   const onMintSuccess = route.params?.onMintSuccess;
 
   const [amount, setAmount] = useState('500');
@@ -26,6 +26,13 @@ export default function MintTokensScreen({ navigation, route }) {
   const [statusMessage, setStatusMessage] = useState('');
 
   const quickPicks = [100, 200, 500, 1000];
+
+  // Ensure dynamic device ID is loaded if not passed in navigation params
+  useEffect(() => {
+    if (!userId) {
+      getUniqueDeviceId().then((id) => setUserId(id));
+    }
+  }, [userId]);
 
   const handleMintRequest = async () => {
     const numericAmount = parseFloat(amount);
@@ -43,16 +50,18 @@ export default function MintTokensScreen({ navigation, route }) {
       return;
     }
 
+    const activeUserId = userId || (await getUniqueDeviceId());
+
     setLoading(true);
     setStatusMessage('Contacting Bank Gateway...');
 
     try {
-      // 1. Submit conversion request to Bank / Admin Server
+      // 1. Submit conversion request to Bank Gateway
       const response = await fetch(`${SERVER_BASE_URL}/api/wallet/mint-request`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          userId,
+          userId: activeUserId,
           amount: numericAmount,
         }),
       });
@@ -65,27 +74,43 @@ export default function MintTokensScreen({ navigation, route }) {
 
       setStatusMessage('Validating Cryptographic Signature...');
 
-      // 2. Offline verification of the Bank's signature using the embedded public key
-      const isAuthentic = verifyBankToken(data.tokenData);
-      if (!isAuthentic) {
-        throw new Error('Security Error: Bank signature failed cryptographic validation.');
+      // 2. Handle both single token object and token array responses
+      const tokensToSave = Array.isArray(data.tokenData)
+        ? data.tokenData
+        : Array.isArray(data.tokens)
+        ? data.tokens
+        : [data.tokenData];
+
+      // Verify cryptographic signature for every token
+      for (const token of tokensToSave) {
+        if (!token) continue;
+        const isAuthentic = verifyBankToken(token);
+        if (!isAuthentic) {
+          throw new Error(`Security Error: Token ${token.tokenId || ''} failed bank signature validation.`);
+        }
       }
 
       setStatusMessage('Encrypting & Saving to Local Vault...');
 
-      // 3. Atomically write minted tokens to the local encrypted SQLite DB
-      await saveMintedToken(data.tokenData);
-      setCurrentFiat((prev) => Math.max(0, prev - numericAmount));
-      if (onMintSuccess) {
+      // 3. Atomically write minted tokens to local SQLite DB
+      for (const token of tokensToSave) {
+        if (!token) continue;
+        await saveMintedToken(token);
+      }
+
+      const updatedFiat = Math.max(0, currentFiat - numericAmount);
+      setCurrentFiat(updatedFiat);
+
+      if (typeof onMintSuccess === 'function') {
         onMintSuccess(numericAmount);
       }
 
       setLoading(false);
       Alert.alert(
         'Conversion Successful',
-        `₹${numericAmount.toFixed(2)} minted and stored in offline vault.`,
+        `₹${numericAmount.toFixed(2)} minted into offline tokens.`,
         [{ text: 'Back to Wallet', onPress: () => navigation.goBack() }]
-      ); 
+      );
     } catch (err) {
       setLoading(false);
       setStatusMessage('');
@@ -101,13 +126,13 @@ export default function MintTokensScreen({ navigation, route }) {
       <View style={styles.card}>
         <Text style={styles.title}>Convert Fiat to Digital Tokens</Text>
         <Text style={styles.subtitle}>
-          Tokens are cryptographically signed by the bank and can be transferred offline via Bluetooth without internet access.
+          Tokens are cryptographically signed by the bank and stored locally for offline Bluetooth payments.
         </Text>
 
         {/* Bank Balance Info Banner */}
         <View style={styles.infoBanner}>
           <Text style={styles.infoLabel}>Available Bank Fiat:</Text>
-          <Text style={styles.infoValue}>₹{maxFiat.toFixed(2)}</Text>
+          <Text style={styles.infoValue}>₹{Number(currentFiat || 0).toFixed(2)}</Text>
         </View>
 
         {/* Amount Input */}
@@ -118,7 +143,7 @@ export default function MintTokensScreen({ navigation, route }) {
             style={styles.input}
             keyboardType="numeric"
             value={amount}
-            onChangeText={setAmount}
+            onChangeText={(val) => setAmount(val.replace(/[^0-9]/g, ''))}
             placeholder="0"
             editable={!loading}
           />
@@ -155,7 +180,14 @@ export default function MintTokensScreen({ navigation, route }) {
             <Text style={styles.loadingText}>{statusMessage}</Text>
           </View>
         ) : (
-          <TouchableOpacity style={styles.mintButton} onPress={handleMintRequest}>
+          <TouchableOpacity
+            style={[
+              styles.mintButton,
+              (currentFiat <= 0 || !amount || parseFloat(amount) <= 0) && styles.mintButtonDisabled,
+            ]}
+            onPress={handleMintRequest}
+            disabled={currentFiat <= 0}
+          >
             <Text style={styles.mintButtonText}>Request & Download Tokens</Text>
           </TouchableOpacity>
         )}
@@ -275,6 +307,9 @@ const styles = StyleSheet.create({
     paddingVertical: 16,
     borderRadius: 14,
     alignItems: 'center',
+  },
+  mintButtonDisabled: {
+    backgroundColor: '#94A3B8',
   },
   mintButtonText: {
     color: '#FFFFFF',

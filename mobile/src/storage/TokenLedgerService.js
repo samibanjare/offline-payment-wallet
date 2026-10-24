@@ -1,131 +1,143 @@
 import { initWalletDB } from './WalletDatabase';
 
 /**
- * Get current spendable balance
+ * Returns the total sum of tokens available for spending.
  */
-export const getSpendableBalance = async () => {
+export async function getSpendableBalance() {
   const db = await initWalletDB();
-  const result = db.execute(`
-    SELECT SUM(amount) as balance FROM tokens WHERE status = 'AVAILABLE';
-  `);
-  return result.rows?._array[0]?.balance || 0;
-};
+  const res = db.getAllSync
+    ? db.getAllSync(`SELECT SUM(amount) as total FROM tokens WHERE status = 'RECEIVED';`)
+    : db.execute(`SELECT SUM(amount) as total FROM tokens WHERE status = 'RECEIVED';`).rows?._array;
+  return res?.[0]?.total || 0;
+}
 
 /**
- * Save newly minted bank tokens from the server
- * Note: Since minting occurs directly with the cloud bank, its sync_status is 'SETTLED'
+ * Locks tokens atomically up to required amount with a session identifier.
  */
-export const saveMintedToken = async (tokenData) => {
-  const db = await initWalletDB();
-  const { tokenId, amount, issuedTo, issuedAt, expiresAt, bankSignature, bankPublicKey } = tokenData;
-
-  db.execute(
-    `INSERT INTO tokens (tokenId, amount, issuedTo, issuedAt, expiresAt, bankSignature, bankPublicKey, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'AVAILABLE');`,
-    [tokenId, amount, issuedTo, issuedAt, expiresAt, bankSignature, bankPublicKey]
-  );
-
-  db.execute(
-    `INSERT INTO transactions (txnId, type, amount, counterpartyId, timestamp, status, sync_status, retryCount)
-     VALUES (?, 'MINT', ?, 'BANK_ADMIN', ?, 'SUCCESS', 'SETTLED', 0);`,
-    [tokenId, amount, Date.now()]
-  );
-};
-
-/**
- * Step 1: Lock tokens before sending over BLE (Prevents concurrent double-spend)
- */
-export const lockTokensForPayment = async (requiredAmount, sessionId) => {
+export async function lockTokensForPayment(targetAmount, transferSessionId) {
   const db = await initWalletDB();
 
-  // Find available tokens that satisfy the amount (greedy/exact match)
-  const availableRows = db.execute(`
-    SELECT * FROM tokens WHERE status = 'AVAILABLE' ORDER BY amount ASC;
-  `);
+  return db.withTransactionSync
+    ? db.withTransactionSync(() => executeLock(db, targetAmount, transferSessionId))
+    : executeLock(db, targetAmount, transferSessionId);
+}
 
-  const tokens = availableRows.rows?._array || [];
-  let gathered = 0;
-  const lockedTokens = [];
+function executeLock(db, targetAmount, transferSessionId) {
+  // Query available unspent tokens
+  const query = `SELECT * FROM tokens WHERE status = 'RECEIVED' ORDER BY amount ASC;`;
+  const availableTokens = db.getAllSync ? db.getAllSync(query) : (db.execute(query).rows?._array || []);
 
-  for (const token of tokens) {
-    lockedTokens.push(token);
-    gathered += token.amount;
-    if (gathered >= requiredAmount) break;
+  let accumulated = 0;
+  const selected = [];
+
+  for (const token of availableTokens) {
+    selected.push(token);
+    accumulated += Number(token.amount);
+    if (accumulated >= targetAmount) break;
   }
 
-  if (gathered < requiredAmount) {
-    throw new Error('Insufficient spendable offline balance');
+  if (accumulated < targetAmount) {
+    throw new Error(`Insufficient offline balance. Needed ₹${targetAmount}, available ₹${accumulated}`);
   }
 
-  // Atomically lock them with session ID
-  for (const token of lockedTokens) {
-    db.execute(
-      `UPDATE tokens SET status = 'LOCKED_PENDING', txSessionId = ? WHERE tokenId = ?;`,
-      [sessionId, token.tokenId]
-    );
+  // Atomically lock all chosen tokens
+  const tokenIds = selected.map((t) => `'${t.tokenId}'`).join(',');
+  const lockQuery = `
+    UPDATE tokens 
+    SET status = 'LOCKED', lockSessionId = '${transferSessionId}' 
+    WHERE tokenId IN (${tokenIds});
+  `;
+
+  if (db.execSync) {
+    db.execSync(lockQuery);
+  } else {
+    db.execute(lockQuery);
   }
 
-  return lockedTokens;
-};
+  return selected;
+}
 
 /**
- * Step 2: Receiver ACK confirmed -> Mark locked tokens as SPENT
- * Queued locally with sync_status = 'PENDING'
+ * Transitions locked tokens to SPENT and logs the transaction.
  */
-export const commitSpentTokens = async (sessionId, receiverId, ackReceipt) => {
+export async function commitSpentTokens(transferSessionId, counterpartyId, ackReceipt) {
   const db = await initWalletDB();
+  const now = Date.now();
 
-  db.execute(
-    `UPDATE tokens SET status = 'SPENT' WHERE txSessionId = ?;`,
-    [sessionId]
-  );
+  const commitWork = () => {
+    // 1. Get tokens to calculate exact total deducted
+    const selectQuery = `SELECT * FROM tokens WHERE lockSessionId = '${transferSessionId}';`;
+    const lockedTokens = db.getAllSync ? db.getAllSync(selectQuery) : (db.execute(selectQuery).rows?._array || []);
+    const totalSpent = lockedTokens.reduce((sum, t) => sum + Number(t.amount || 0), 0);
 
-  db.execute(
-    `INSERT INTO transactions (txnId, type, amount, counterpartyId, timestamp, status, sync_status, retryCount, rawAck)
-     VALUES (?, 'SENT', ?, ?, ?, 'COMMITTED', 'PENDING', 0, ?);`,
-    [ackReceipt.txnId, ackReceipt.amount, receiverId, Date.now(), JSON.stringify(ackReceipt)]
-  );
-};
+    // 2. Mark tokens SPENT
+    const updateQuery = `
+      UPDATE tokens 
+      SET status = 'SPENT', lockSessionId = NULL 
+      WHERE lockSessionId = '${transferSessionId}';
+    `;
+    if (db.execSync) db.execSync(updateQuery);
+    else db.execute(updateQuery);
+
+    // 3. Record in transactions log
+    const txId = ackReceipt?.txnId || `tx_sent_${now}`;
+    const insertTx = `
+      INSERT INTO transactions (txnId, type, amount, status, counterpartyId, timestamp)
+      VALUES ('${txId}', 'SENT', ${totalSpent}, 'COMMITTED', '${counterpartyId}', ${now});
+    `;
+    if (db.execSync) db.execSync(insertTx);
+    else db.execute(insertTx);
+
+    return { txId, totalSpent };
+  };
+
+  return db.withTransactionSync ? db.withTransactionSync(commitWork) : commitWork();
+}
 
 /**
- * Rollback: If BLE connection fails or times out before ACK
+ * Safe Rollback: unlocks tokens if ACK was not received.
  */
-export const rollbackLockedTokens = async (sessionId) => {
+export async function rollbackLockedTokens(transferSessionId) {
   const db = await initWalletDB();
-  db.execute(
-    `UPDATE tokens SET status = 'AVAILABLE', txSessionId = NULL WHERE txSessionId = ?;`,
-    [sessionId]
-  );
-};
+  const query = `
+    UPDATE tokens 
+    SET status = 'RECEIVED', lockSessionId = NULL 
+    WHERE lockSessionId = '${transferSessionId}' AND status = 'LOCKED';
+  `;
+  if (db.execSync) db.execSync(query);
+  else db.execute(query);
+}
 
 /**
- * Receiver Side: Save incoming validated token from BLE
- * Queued locally with sync_status = 'PENDING'
+ * Receiver side: stores full batch idempotently.
  */
-export const recordReceivedToken = async (tokenData, senderId, ackData) => {
+export async function recordReceivedTokensBatch(tokens, senderId, receiverId, transferSessionId) {
   const db = await initWalletDB();
-  const { tokenId, amount, issuedTo, issuedAt, expiresAt, bankSignature, bankPublicKey } = tokenData;
+  const now = Date.now();
 
-  db.execute(
-    `INSERT INTO tokens (tokenId, amount, issuedTo, issuedAt, expiresAt, bankSignature, bankPublicKey, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'RECEIVED');`,
-    [tokenId, amount, issuedTo, issuedAt, expiresAt, bankSignature, bankPublicKey]
-  );
+  const batchWork = () => {
+    let totalReceived = 0;
 
-  db.execute(
-    `INSERT INTO transactions (txnId, type, amount, counterpartyId, timestamp, status, sync_status, retryCount, rawAck)
-     VALUES (?, 'RECEIVED', ?, ?, ?, 'COMMITTED', 'PENDING', 0, ?);`,
-    [tokenId, amount, senderId, Date.now(), JSON.stringify(ackData)]
-  );
-};
+    for (const token of tokens) {
+      totalReceived += Number(token.amount || 0);
+      const insertToken = `
+        INSERT OR IGNORE INTO tokens (tokenId, amount, currency, status, rawData, signature, lockSessionId)
+        VALUES ('${token.tokenId}', ${Number(token.amount)}, '${token.currency || 'INR'}', 'RECEIVED', '${JSON.stringify(token)}', '${token.signature || ''}', NULL);
+      `;
+      if (db.execSync) db.execSync(insertToken);
+      else db.execute(insertToken);
+    }
 
-/**
- * Helper: Fetch pending items count for the outbox UI badge
- */
-export const getPendingOutboxCount = async () => {
-  const db = await initWalletDB();
-  const result = db.execute(`
-    SELECT COUNT(*) as pendingCount FROM transactions WHERE sync_status = 'PENDING';
-  `);
-  return result.rows?._array[0]?.pendingCount || 0;
-};
+    const txnId = `tx_recv_${transferSessionId}`;
+    const insertTx = `
+      INSERT OR IGNORE INTO transactions (txnId, type, amount, status, counterpartyId, timestamp)
+      VALUES ('${txnId}', 'RECEIVED', ${totalReceived}, 'COMMITTED', '${senderId}', ${now});
+    `;
+    if (db.execSync) db.execSync(insertTx);
+    else db.execute(insertTx);
+
+    return { txnId, totalReceived };
+  };
+
+  return db.withTransactionSync ? db.withTransactionSync(batchWork) : batchWork();
+}

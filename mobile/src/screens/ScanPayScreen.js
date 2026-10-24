@@ -21,6 +21,7 @@ import {
   commitSpentTokens,
   rollbackLockedTokens,
 } from '../storage/TokenLedgerService';
+import { getUniqueDeviceId } from '../services/DeviceIdentityService';
 
 
 const ResolvedPaymentModal =
@@ -43,7 +44,15 @@ const useCameraPerms =
 const bleCentral = new BleManager();
 
 
-const ScanPayScreen = () => {
+const ScanPayScreen = ({ route, navigation }) => {
+  const [senderId, setSenderId] = useState(route.params?.senderId || null);
+
+  useEffect(() => {
+    if (!senderId) {
+      getUniqueDeviceId().then((id) => setSenderId(id));
+    }
+  }, [senderId]);
+
   const { height: screenHeight, width: screenWidth } =
     useWindowDimensions();
 
@@ -138,207 +147,94 @@ const ScanPayScreen = () => {
   };
 
 
-  const handleStartBleTransaction = async () => {
-    if (transactionInProgress.current || !scannedData) return;
+ const handleStartBleTransaction = async () => {
+    if (transactionInProgress.current) return;
+    transactionInProgress.current = true;
 
+    const activeSender = senderId || (await getUniqueDeviceId());
+    const sessionId = `tx_${senderId || 'dev'}_${Date.now()}`;
+    let selectedTokens = [];
 
-    const amount = Number(transferAmount);
-
-
-    if (!Number.isSafeInteger(amount) || amount <= 0) {
-      Alert.alert(
-        'Invalid Amount',
-        'Enter a positive whole-number amount.'
-      );
+    try {
+      selectedTokens = await lockTokensForPayment(Number(transferAmount), sessionId);
+    } catch (err) {
+      transactionInProgress.current = false;
+      Alert.alert('Balance Error', err.message);
       return;
     }
 
+    setIsProcessing(true);
+    setStatusMessage('Scanning for receiver...');
 
-    transactionInProgress.current = true;
+    let ackReceived = false;
+    let isConnecting = false;
 
-
-    const sessionId = `session_${Date.now()}`;
-    let tokensLocked = false;
-    let paymentStarted = false;
-
-
-    try {
-      setStatusMessage('Checking Bluetooth...');
-      setIsProcessing(true);
-
-
-      const bluetoothState = await bleCentral.state();
-
-
-      if (bluetoothState !== 'PoweredOn') {
-        const message =
-          bluetoothState === 'PoweredOff'
-            ? 'Turn on Bluetooth on your phone, then try again.'
-            : `Bluetooth is not ready (${bluetoothState}). Enable Bluetooth and try again.`;
-
-
-        Alert.alert('Bluetooth Required', message);
-        return;
-      }
-
-
-      setStatusMessage('Reserving tokens...');
-
-
-      const selectedTokens = await lockTokensForPayment(
-        amount,
-        sessionId
-      );
-
-
-      if (!selectedTokens || selectedTokens.length === 0) {
-        throw new Error(
-          'No eligible tokens are available for this payment.'
+    // Safety timeout: rollback if ACK is not received within 15 seconds
+    const timeoutId = setTimeout(async () => {
+      if (!ackReceived) {
+        bleCentral.stopDeviceScan();
+        await rollbackLockedTokens(sessionId);
+        setIsProcessing(false);
+        setStatusMessage('');
+        transactionInProgress.current = false;
+        Alert.alert(
+          'Payment Timed Out',
+          'No confirmation received from the receiver. Your balance has been restored.'
         );
       }
+    }, 15000);
 
+    try {
+      bleCentral.startDeviceScan(
+        [scannedData.serviceUuid],
+        { allowDuplicates: false },
+        async (error, scannedDevice) => {
+          if (error) {
+            console.error('[ScanPay] Scan error:', error);
+            return;
+          }
 
-      tokensLocked = true;
-      setStatusMessage('Searching for receiver...');
+          // Check both name and localName against QR advertised name
+          const deviceName = scannedDevice?.name || scannedDevice?.localName;
+          const targetName = scannedData.advertisedName;
 
+          if (!isConnecting && (deviceName === targetName || scannedDevice?.id)) {
+            isConnecting = true;
+            bleCentral.stopDeviceScan();
+            setStatusMessage('Connecting & transferring tokens...');
 
-      const device = await new Promise((resolve, reject) => {
-        let finished = false;
-        let timeout;
+            try {
+              // Pass the full selectedTokens array (or first token)
+              await sendPaymentViaBle(scannedDevice.id, selectedTokens, senderId, sessionId, async (ackReceipt) => {
+                ackReceived = true;
+                clearTimeout(timeoutId);
 
-
-        const finish = (error, foundDevice) => {
-          if (finished) return;
-
-
-          finished = true;
-          clearTimeout(timeout);
-          bleCentral.stopDeviceScan();
-
-
-          if (error) reject(error);
-          else resolve(foundDevice);
-        };
-
-
-        timeout = setTimeout(() => {
-          finish(
-            new Error(
-              'Receiver not found. Keep the receiver screen open, enable Bluetooth, and ensure the receiver is advertising.'
-            )
-          );
-        }, 20000);
-
-
-        try {
-          bleCentral.startDeviceScan(
-            [scannedData.serviceUuid],
-            null,
-            (error, foundDevice) => {
-              if (error) {
-                finish(
-                  new Error(
-                    `Bluetooth scan failed: ${
-                      error.message || 'Unknown BLE error'
-                    }`
-                  )
-                );
-                return;
-              }
-
-
-              if (
-                foundDevice?.name === scannedData.advertisedName
-              ) {
-                finish(null, foundDevice);
-              }
+                // Commit tokens to SPENT only after valid ACK
+                await commitSpentTokens(sessionId, scannedData.receiverId, ackReceipt);
+                setIsProcessing(false);
+                setStatusMessage('');
+                transactionInProgress.current = false;
+                setCompletedTxn(ackReceipt);
+              });
+            } catch (transferErr) {
+              clearTimeout(timeoutId);
+              await rollbackLockedTokens(sessionId);
+              setIsProcessing(false);
+              setStatusMessage('');
+              transactionInProgress.current = false;
+              Alert.alert('Transfer Error', transferErr.message || 'Payment transfer failed.');
             }
-          );
-        } catch (error) {
-          finish(error);
-        }
-      });
-
-
-      paymentStarted = true;
-      setStatusMessage('Sending payment...');
-
-
-      await sendPaymentViaBle(
-        device.id,
-        selectedTokens[0],
-        async (ackReceipt) => {
-          try {
-            if (!ackReceipt) {
-              throw new Error(
-                'The receiver returned an empty receipt.'
-              );
-            }
-
-
-            await commitSpentTokens(
-              sessionId,
-              scannedData.receiverId,
-              ackReceipt
-            );
-
-
-            tokensLocked = false;
-            setCompletedTxn(ackReceipt);
-          } catch (error) {
-            console.error(
-              '[ScanPayScreen] Receipt commit failed:',
-              error
-            );
-
-
-            Alert.alert(
-              'Payment Status Needs Checking',
-              'The receipt could not be confirmed in the local ledger. Do not retry until the transaction status has been reconciled.'
-            );
           }
         }
       );
-    } catch (error) {
-      console.error('[ScanPayScreen] Payment error:', error);
-
-
-      if (tokensLocked) {
-        try {
-          await rollbackLockedTokens(sessionId);
-          tokensLocked = false;
-        } catch (rollbackError) {
-          console.error(
-            '[ScanPayScreen] Token rollback failed:',
-            rollbackError
-          );
-
-
-          Alert.alert(
-            'Balance Recovery Required',
-            'Reserved tokens could not be restored. Check the local token ledger before retrying.'
-          );
-          return;
-        }
-      }
-
-
-      if (paymentStarted) {
-        Alert.alert(
-          'Payment Status Uncertain',
-          'The transfer encountered an error after transmission began. Verify the receiver and transaction ledger before retrying.'
-        );
-      } else {
-        Alert.alert(
-          'Transaction Failed',
-          error?.message || 'Payment could not be started.'
-        );
-      }
-    } finally {
+    } catch (err) {
+      clearTimeout(timeoutId);
       bleCentral.stopDeviceScan();
+      await rollbackLockedTokens(sessionId);
       setIsProcessing(false);
       setStatusMessage('');
       transactionInProgress.current = false;
+      Alert.alert('Connection Failed', err.message);
     }
   };
 

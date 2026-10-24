@@ -7,7 +7,6 @@ import {
   ScrollView,
   RefreshControl,
   ActivityIndicator,
-  Alert,
 } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import NetInfo from '@react-native-community/netinfo';
@@ -15,10 +14,11 @@ import { getSpendableBalance } from '../storage/TokenLedgerService';
 import { syncOfflineTokensWithBank } from '../services/sync/ReconciliationService';
 import { initWalletDB } from '../storage/WalletDatabase';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import { getUniqueDeviceId } from '../services/DeviceIdentityService';
 
 export default function HomeScreen({ navigation }) {
+  const [userId, setUserId] = useState(null);
   const [offlineTokenBalance, setOfflineTokenBalance] = useState(0);
-  // const [fiatBalance, setFiatBalance] = useState(2500.0); // Fetched from bank backend
   const [fiatBalance, setFiatBalance] = useState(null);
   const [isLoadingBankBalance, setIsLoadingBankBalance] = useState(false);
   const [recentTransactions, setRecentTransactions] = useState([]);
@@ -27,22 +27,52 @@ export default function HomeScreen({ navigation }) {
   const [isSyncing, setIsSyncing] = useState(false);
   const [isOnline, setIsOnline] = useState(true);
 
-  const USER_ID = 'merchant_9876';
+  // const USER_ID = 'merchant_9876';
   const SERVER_BASE_URL = 'https://offline-payment-wallet-2.onrender.com';
 
-  // Monitor network status for auto-reconciliation
   useEffect(() => {
-    const unsubscribe = NetInfo.addEventListener((state) => {
-      const online = Boolean(state.isConnected && state.isInternetReachable);
-      setIsOnline(online);
-      if (online) {
-        triggerBankReconciliation();
-      }
-    });
-    return () => unsubscribe();
-  }, []);
+  const unsubscribe = NetInfo.addEventListener((state) => {
+    const online =
+      state.isConnected === true &&
+      state.isInternetReachable !== false;
 
-  const fetchBankBalance = async () => {
+    setIsOnline(online);
+
+    if (online) {
+      triggerBankReconciliation();
+    }
+  });
+
+  return unsubscribe;
+}, []);
+
+  //...
+  useEffect(() => {
+  let cancelled = false;
+
+  const initializeUserId = async () => {
+    try {
+      const userid = await getUniqueDeviceId();
+
+      if (!cancelled) {
+        setUserId(userid);
+        fetchBankBalance(userid);
+      }
+    } catch (error) {
+      console.error('Failed to get device ID:', error);
+    }
+  };
+
+  initializeUserId();
+
+  return () => {
+    cancelled = true;
+  };
+}, []);
+
+  const fetchBankBalance = async (targetId) => {
+    const activeId = targetId || userId;
+    if (!activeId) return;
     setIsLoadingBankBalance(true);
 
     try {
@@ -50,25 +80,18 @@ export default function HomeScreen({ navigation }) {
       const timeoutId = setTimeout(() => controller.abort(), 8000);
 
       const response = await fetch(
-        `${SERVER_BASE_URL}/api/bank/balance/${USER_ID}`,
+        `${SERVER_BASE_URL}/api/bank/balance/${activeId}`,
         { signal: controller.signal }
       );
       clearTimeout(timeoutId);
 
-      if (!response.ok) {
-        throw new Error(`Bank API failed: ${response.status}`);
+      if (response.ok) {
+        const data = await response.json();
+        const balanceValue = data.fiatBalance ?? data.balance;
+        if (typeof balanceValue === 'number' && Number.isFinite(balanceValue)) {
+          setFiatBalance(balanceValue);
+        }
       }
-
-      const data = await response.json();
-
-      // Read fiatBalance from backend response with fallback to balance
-      const balanceValue = data.fiatBalance ?? data.balance;
-
-      if (typeof balanceValue !== 'number' || !Number.isFinite(balanceValue)) {
-        throw new Error('Invalid bank balance returned by API');
-      }
-
-      setFiatBalance(balanceValue);
     } catch (error) {
       console.error('Failed to fetch bank balance:', error.message);
     } finally {
@@ -80,18 +103,18 @@ export default function HomeScreen({ navigation }) {
     try {
       const db = await initWalletDB();
 
-      // 1. Fetch offline spendable token balance
+      // 1. Fetch spendable balance
       const spendable = await getSpendableBalance();
-      setOfflineTokenBalance(spendable);
+      setOfflineTokenBalance(Number(spendable || 0));
 
-      // 2. Fetch pending sync items (Tokens collected offline waiting for settlement)
+      // 2. Fetch pending settlement count
       const pendingResult = db.execute(
         `SELECT COUNT(*) as count FROM tokens WHERE status = 'RECEIVED';`
       );
       const pendingCount = pendingResult.rows?._array[0]?.count || 0;
-      setPendingSyncCount(pendingCount);
+      setPendingSyncCount(Number(pendingCount));
 
-      // 3. Fetch latest 5 transactions
+      // 3. Fetch latest transactions
       const txResult = db.execute(
         `SELECT * FROM transactions ORDER BY timestamp DESC LIMIT 5;`
       );
@@ -104,8 +127,10 @@ export default function HomeScreen({ navigation }) {
   useFocusEffect(
     useCallback(() => {
       loadWalletData();
-      fetchBankBalance();
-    }, [])
+      if (userId) {
+        fetchBankBalance(userId);
+      }
+    }, [userId])
   );
 
   const onRefresh = async () => {
@@ -118,10 +143,10 @@ export default function HomeScreen({ navigation }) {
   };
 
   const triggerBankReconciliation = async () => {
-    if (isSyncing) return;
+    if (isSyncing || !userId) return;
     setIsSyncing(true);
     try {
-      const res = await syncOfflineTokensWithBank(USER_ID);
+      const res = await syncOfflineTokensWithBank(userId);
       if (res?.synced && res?.settledCount > 0) {
         setFiatBalance(res.newBalance);
         await loadWalletData();
@@ -164,7 +189,7 @@ export default function HomeScreen({ navigation }) {
         <View style={styles.balanceSplitRow}>
           <View style={styles.balanceCol}>
             <Text style={styles.balanceSublabel}>Offline Token Balance</Text>
-            <Text style={styles.tokenAmount}>₹{offlineTokenBalance.toFixed(2)}</Text>
+            <Text style={styles.tokenAmount}>₹{Number(offlineTokenBalance || 0).toFixed(2)}</Text>
             <Text style={styles.balanceHint}>Ready for offline BLE pay</Text>
           </View>
 
@@ -176,7 +201,7 @@ export default function HomeScreen({ navigation }) {
               {isLoadingBankBalance && fiatBalance === null
                 ? 'Loading...'
                 : fiatBalance !== null
-                ? `₹${fiatBalance.toFixed(2)}`
+                ? `₹${Number(fiatBalance).toFixed(2)}`
                 : 'Unavailable'}
             </Text>
 
@@ -188,16 +213,14 @@ export default function HomeScreen({ navigation }) {
           </View>
         </View>
 
-        {/* Action to Request Bank Token Conversion */}
         <TouchableOpacity
           style={styles.convertBtn}
           disabled={fiatBalance === null || fiatBalance <= 0}
           onPress={() =>
             navigation.navigate('MintTokens', {
-              userId: USER_ID,
-              fiatBalance: fiatBalance, // The exact value already loaded on HomeScreen
+              userId: userId,
+              fiatBalance: fiatBalance,
               onMintSuccess: (deductedAmount) => {
-                // Immediately subtract from HomeScreen state
                 setFiatBalance((prev) => Math.max(0, (prev || 0) - deductedAmount));
               },
             })
@@ -207,17 +230,15 @@ export default function HomeScreen({ navigation }) {
         </TouchableOpacity>
       </View>
 
-      {/* Primary Actions: Send (Central) & Receive (Peripheral) */}
+      {/* Actions */}
       <View style={styles.actionRow}>
         <TouchableOpacity
           style={[styles.actionBtn, { backgroundColor: '#00BAF2' }]}
-          onPress={() => navigation.navigate('ScanPay')}
+          onPress={() => navigation.navigate('ScanPay',{ senderId: userId })}
         >
-          <Text style={styles.actionBtnIcon}><MaterialCommunityIcons
-            name="qrcode-scan"
-            size={24}
-            color="#000000"
-          /></Text>
+          <View style={styles.actionBtnIconContainer}>
+            <MaterialCommunityIcons name="qrcode-scan" size={24} color="#FFFFFF" />
+          </View>
           <Text style={styles.actionBtnText}>Scan QR & Pay</Text>
         </TouchableOpacity>
 
@@ -226,21 +247,17 @@ export default function HomeScreen({ navigation }) {
           onPress={() => {
             const availableRoutes = navigation.getState()?.routeNames || [];
             const targetRoute = availableRoutes.includes('ReceiveQrScreen') ? 'ReceiveQrScreen' : 'ReceiveQr';
-            navigation.navigate(targetRoute, { receiverId: USER_ID });
+            navigation.navigate(targetRoute, { receiverId: userId });
           }}
         >
-          <Text style={styles.actionBtnIcon}>
-            <MaterialCommunityIcons
-              name="bluetooth"
-              size={24}
-              color="#000000"
-            />
-          </Text>
+          <View style={styles.actionBtnIconContainer}>
+            <MaterialCommunityIcons name="bluetooth" size={24} color="#FFFFFF" />
+          </View>
           <Text style={styles.actionBtnText}>Receive via BLE</Text>
         </TouchableOpacity>
       </View>
 
-      {/* Recent Activity / Audit Ledger */}
+      {/* Recent Activity */}
       <View style={styles.sectionHeader}>
         <Text style={styles.sectionTitle}>Recent Offline Transactions</Text>
         <TouchableOpacity onPress={() => navigation.navigate('Transactions')}>
@@ -254,7 +271,7 @@ export default function HomeScreen({ navigation }) {
         </View>
       ) : (
         recentTransactions.map((tx) => (
-          <View key={tx.txnId} style={styles.txRow}>
+          <View key={tx.txnId || tx.tokenId || Math.random().toString()} style={styles.txRow}>
             <View style={styles.txLeft}>
               <View
                 style={[
@@ -271,7 +288,11 @@ export default function HomeScreen({ navigation }) {
                   {tx.type === 'MINT' ? 'Bank Token Mint' : tx.counterpartyId}
                 </Text>
                 <Text style={styles.txDate}>
-                  {new Date(tx.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} • {tx.status}
+                  {new Date(tx.timestamp || Date.now()).toLocaleTimeString([], {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  })}{' '}
+                  • {tx.status}
                 </Text>
               </View>
             </View>
@@ -282,7 +303,8 @@ export default function HomeScreen({ navigation }) {
                 { color: tx.type === 'RECEIVED' ? '#10B981' : tx.type === 'MINT' ? '#00BAF2' : '#1E293B' },
               ]}
             >
-              {tx.type === 'RECEIVED' ? '+' : tx.type === 'MINT' ? '' : '-'}₹{tx.amount.toFixed(2)}
+              {tx.type === 'RECEIVED' ? '+' : tx.type === 'MINT' ? '' : '-'}₹
+              {Number(tx.amount || 0).toFixed(2)}
             </Text>
           </View>
         ))
@@ -316,8 +338,8 @@ const styles = StyleSheet.create({
   },
   convertBtnText: { color: '#38BDF8', fontSize: 13, fontWeight: '700' },
   actionRow: { flexDirection: 'row', gap: 12, marginBottom: 24 },
-  actionBtn: { flex: 1, paddingVertical: 16, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
-  actionBtnIcon: { fontSize: 22, marginBottom: 4 },
+  actionBtn: { flex: 1, paddingVertical: 14, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
+  actionBtnIconContainer: { marginBottom: 4 },
   actionBtnText: { color: '#FFFFFF', fontWeight: '700', fontSize: 14 },
   sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
   sectionTitle: { fontSize: 16, fontWeight: '700', color: '#0F172A' },

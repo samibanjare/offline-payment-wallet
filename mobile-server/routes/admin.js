@@ -79,4 +79,77 @@ router.get('/api/admin/tokens', async (req, res) => {
   }
 });
 
+// 5. Admin: Create a new bank user account manually
+router.post('/api/admin/users', async (req, res) => {
+  try {
+    const { userId, name, role, initialBalance } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'userId is required' });
+    }
+
+    const existing = await User.findOne({ userId });
+    if (existing) {
+      return res.status(409).json({ success: false, error: 'User already exists' });
+    }
+
+    const user = await User.create({
+      userId,
+      name: name || 'App User',
+      role: role || 'USER',
+      fiatBalance: Number(initialBalance) || 5000.0,
+    });
+
+    await ActivityLog.create({
+      userId,
+      action: 'USER_REGISTERED',
+      amount: user.fiatBalance,
+      status: 'SUCCESS',
+      details: { role: user.role, name: user.name },
+    });
+
+    return res.status(201).json({ success: true, user });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 6. Admin: Credit or Adjust User Balance
+router.post('/api/admin/users/:userId/balance', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { amount, actionType } = req.body; // actionType: 'CREDIT' or 'SET'
+
+    const user = await User.findOne({ userId });
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const delta = Number(amount);
+    if (isNaN(delta)) {
+      return res.status(400).json({ success: false, error: 'Invalid amount' });
+    }
+
+    if (actionType === 'SET') {
+      user.fiatBalance = Math.max(0, delta);
+    } else {
+      user.fiatBalance = Math.max(0, user.fiatBalance + delta);
+    }
+
+    await user.save();
+
+    await ActivityLog.create({
+      userId,
+      action: 'RECONCILE_SUCCESS',
+      amount: delta,
+      status: 'SUCCESS',
+      details: { note: 'Admin balance adjustment', newBalance: user.fiatBalance },
+    });
+
+    return res.status(200).json({ success: true, user });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 module.exports = router;

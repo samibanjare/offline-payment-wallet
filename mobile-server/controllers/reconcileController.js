@@ -11,7 +11,7 @@ exports.reconcileTokens = async (req, res) => {
     return res.status(400).json({ success: false, error: 'receiverId is required' });
   }
 
-  // Allow call if there is at least an auditBatch OR submissions to reconcile
+  // Validate payload structures
   if (!Array.isArray(submissions) || !Array.isArray(auditBatch)) {
     return res.status(400).json({ success: false, error: 'Invalid payload structures' });
   }
@@ -21,9 +21,10 @@ exports.reconcileTokens = async (req, res) => {
   }
 
   try {
+    // Ensure receiver account exists in MongoDB
     const receiver = await createOrUpdateUser(receiverId);
 
-    // 1. Ingest Offline Outbox Audit Logs (Both SENT & RECEIVED records)
+    // 1. Ingest Offline Outbox Audit Logs (SENT & RECEIVED offline records)
     if (auditBatch.length > 0) {
       for (const item of auditBatch) {
         await recordLog(
@@ -37,7 +38,7 @@ exports.reconcileTokens = async (req, res) => {
       }
     }
 
-    // 2. Process Token Redemptions (Fiat conversion)
+    // 2. Process Token Redemptions (Fiat conversion & vault settlement)
     const bankPublicKeyBytes = decodeBase64(getBankPublicKey());
     const settledTokenIds = [];
     const rejectedTokenIds = [];
@@ -45,9 +46,14 @@ exports.reconcileTokens = async (req, res) => {
 
     for (const item of submissions) {
       const { tokenData, ackReceipt } = item;
+
+      if (!tokenData) {
+        continue;
+      }
+
       const { tokenId, amount, issuedTo, issuedAt, expiresAt, bankSignature } = tokenData;
 
-      // Check A: Double-Spend Check
+      // Check A: Double-Spend Verification
       const alreadyRedeemed = await RedeemedToken.findOne({ tokenId });
       if (alreadyRedeemed) {
         rejectedTokenIds.push({ tokenId, reason: 'DOUBLE_SPEND_DETECTED_ALREADY_REDEEMED' });
@@ -62,7 +68,7 @@ exports.reconcileTokens = async (req, res) => {
         continue;
       }
 
-      // Check B: Expiry Check
+      // Check B: Expiry Verification
       if (Date.now() > expiresAt) {
         rejectedTokenIds.push({ tokenId, reason: 'TOKEN_EXPIRED' });
         await recordLog(
@@ -76,7 +82,7 @@ exports.reconcileTokens = async (req, res) => {
         continue;
       }
 
-      // Check C: Cryptographic Signature Verification
+      // Check C: Cryptographic Bank Signature Verification
       const rawToken = { tokenId, issuedTo, amount, issuedAt, expiresAt };
       const messageBytes = decodeUTF8(JSON.stringify(rawToken));
       const signatureBytes = decodeBase64(bankSignature);
@@ -95,7 +101,7 @@ exports.reconcileTokens = async (req, res) => {
         continue;
       }
 
-      // Record Redeemed Token in MongoDB
+      // Commit settlement to MongoDB RedeemedToken ledger
       await RedeemedToken.create({
         tokenId,
         settledBy: receiverId,
@@ -108,16 +114,17 @@ exports.reconcileTokens = async (req, res) => {
       totalCredited += Number(amount);
     }
 
-    // 3. Credit Fiat Balance if any tokens were redeemed
+    // 3. Credit Fiat Balance to receiver account
     if (totalCredited > 0) {
       receiver.fiatBalance += totalCredited;
       await receiver.save();
+
       await recordLog(
         receiverId,
         'RECONCILE_SUCCESS',
         totalCredited,
         'SUCCESS',
-        { settledCount: settledTokenIds.length },
+        { settledCount: settledTokenIds.length, settledTokenIds },
         clientIp
       );
     }

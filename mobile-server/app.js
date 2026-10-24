@@ -1,22 +1,21 @@
 const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
-
+const path = require('path');
 // require('dotenv').config();
-const { connectDB } = require('./utils/db');
 
+const { connectDB, createOrUpdateUser, recordLog } = require('./utils/db');
 const { mintTokens } = require('./controllers/mintController');
 const { reconcileTokens } = require('./controllers/reconcileController');
 const { getBankPublicKey } = require('./utils/keyManager');
-const { getDB } = require('./utils/db');
 
 const app = express();
-const path = require('path');
 
 app.use(cors());
 app.use(express.json());
 app.use(morgan('dev'));
 
+// Connect MongoDB Atlas
 connectDB();
 
 const adminRoutes = require('./routes/admin');
@@ -36,40 +35,33 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// User balance lookup
-app.get('/api/wallet/user/:userId', (req, res) => {
-  const db = getDB();
-  const user = db.users[req.params.userId] || { fiatBalance: 0 };
-  res.json({ userId: req.params.userId, fiatBalance: user.fiatBalance });
-});
+// GET /api/bank/balance/:userId - Auto-provisions new hardware IDs
+app.get('/api/bank/balance/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    // Finds existing user or creates a new bank account with ₹5,000 initial balance
+    const user = await createOrUpdateUser(userId, `Device User (${userId.slice(-6)})`, 'USER', 5000.0);
 
-// GET /api/bank/balance/:userId
-app.get('/api/bank/balance/:userId', (req, res) => {
-  const { userId } = req.params;
-  const db = getDB();
+    // Audit log
+    await recordLog(userId, 'BALANCE_CHECK', 0, 'SUCCESS', { fiatBalance: user.fiatBalance }, req.ip);
 
-  // If user does not exist in store, bootstrap them with a default balance
-  if (!db.users[userId]) {
-    db.users[userId] = { fiatBalance: 5000.0 };
-    saveDB(db);
+    return res.status(200).json({
+      success: true,
+      userId: user.userId,
+      fiatBalance: user.fiatBalance,
+      currency: 'INR',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
   }
-
-  const user = db.users[userId];
-
-  return res.status(200).json({
-    success: true,
-    userId,
-    fiatBalance: user.fiatBalance,
-    currency: 'INR',
-    timestamp: new Date().toISOString(),
-  });
 });
 
 // Minting & Reconciliation
 app.post('/api/wallet/mint-request', mintTokens);
 app.post('/api/wallet/reconcile', reconcileTokens);
 
-// Use Render's dynamic port or default to 4000 locally
 const PORT = process.env.PORT || 4000;
 const HOST = '0.0.0.0';
 

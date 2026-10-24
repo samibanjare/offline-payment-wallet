@@ -1,4 +1,3 @@
-
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   View,
@@ -12,6 +11,7 @@ import {
 } from 'react-native';
 import QRCode from 'react-native-qrcode-svg';
 import DeviceInfo from 'react-native-device-info';
+import { getUniqueDeviceId } from '../services/DeviceIdentityService';
 
 import {
   startReceiverGattServer,
@@ -21,89 +21,120 @@ import {
 import { PaymentSuccessModal } from './PaymentSuccessModal';
 import { requestBlePermissions } from '../services/ble/BlePermissions';
 
-const ReceiveQrScreen = ({ route }) => {
-  const receiverId = route.params?.receiverId || 'merchant_9876';
-
+const ReceiveQrScreen = ({ route, navigation }) => {
+  const [receiverId, setReceiverId] = useState(route.params?.receiverId || null);
   const [deviceId, setDeviceId] = useState(null);
   const [isAdvertising, setIsAdvertising] = useState(false);
   const [completedTxn, setCompletedTxn] = useState(null);
   const [error, setError] = useState(null);
   const [attempt, setAttempt] = useState(0);
 
-  const initializeReceiver = useCallback(async (isMounted) => {
-    setError(null);
-    setIsAdvertising(false);
 
-    try {
-      const granted = await requestBlePermissions();
-
-      if (!isMounted()) return;
-
-      if (!granted) {
-        throw new Error(
-          'Bluetooth permissions are required. Allow Nearby devices in Android Settings and try again.'
-        );
-      }
-
-      const uniqueId = await DeviceInfo.getUniqueId();
-
-      if (!isMounted()) return;
-      setDeviceId(uniqueId);
-
-      console.log('[ReceiveQrScreen] Starting BLE receiver...');
-
-      await startReceiverGattServer(receiverId, (receipt) => {
-        if (isMounted()) {
-          console.log('[ReceiveQrScreen] Payment receipt received');
-          setCompletedTxn(receipt);
-        }
-      });
-
-      if (!isMounted()) return;
-
-      setIsAdvertising(true);
-      console.log('[ReceiveQrScreen] BLE receiver started');
-    } catch (err) {
-      if (!isMounted()) return;
-
-      console.error('[ReceiveQrScreen] Initialization failed:', err);
-
-      const message = String(err?.message || err || '');
-      const code = String(err?.code || '');
-
-      if (
-        code === 'BLUETOOTH_OFF' ||
-        /bluetooth.*(off|disabled|not enabled)|adapter.*disabled/i.test(message)
-      ) {
-        setError('Bluetooth is turned off. Turn on Bluetooth to receive offline payments.');
-      } else if (
-        code === 'BLE_ADVERTISING_UNAVAILABLE' ||
-        /advertiser.*null|advertising.*unavailable/i.test(message)
-      ) {
-        setError(
-          'BLE advertising is unavailable. Turn on Bluetooth and check whether this phone supports Bluetooth LE advertising.'
-        );
-      } else if (
-        /permission|not authorized|securityexception/i.test(message)
-      ) {
-        setError(
-          'Bluetooth permission is missing. Allow Nearby devices in Android Settings, then retry.'
-        );
-      } else {
-        setError(message || 'Could not start the Bluetooth receiver.');
-      }
-
-      setIsAdvertising(false);
+  useEffect(() => {
+    if (!receiverId) {
+      getUniqueDeviceId().then((id) => setReceiverId(id));
     }
   }, [receiverId]);
 
+  const safeAdvertisedName = receiverId 
+    ? `PAY_${receiverId.replace(/[^a-zA-Z0-9]/g, '')}`.substring(0, 16)
+    : 'PAY_RECEIVER';
+
+  const initializeReceiver = useCallback(
+    async (isMounted) => {
+      if (!receiverId) return null; // Wait until device receiverId is resolved
+      setError(null);
+      setIsAdvertising(false);
+
+      try {
+        const granted = await requestBlePermissions();
+
+        if (!isMounted()) return null;
+
+        if (!granted) {
+          throw new Error(
+            'Bluetooth permissions are required. Allow Nearby devices in Android Settings and try again.'
+          );
+        }
+
+        setDeviceId(receiverId);
+        console.log('[ReceiveQrScreen] Starting BLE receiver...');
+
+        // Start GATT peripheral and receive cleanup closure
+        const cleanupGattServer = await startReceiverGattServer(
+          receiverId,
+          (receipt) => {
+            if (isMounted()) {
+              console.log('[ReceiveQrScreen] Payment receipt received:', receipt);
+              setCompletedTxn(receipt);
+            }
+          }
+        );
+
+        if (!isMounted()) {
+          cleanupGattServer?.();
+          return null;
+        }
+
+        setIsAdvertising(true);
+        console.log('[ReceiveQrScreen] BLE receiver started');
+
+        return cleanupGattServer;
+      } catch (err) {
+        if (!isMounted()) return null;
+
+        console.error('[ReceiveQrScreen] Initialization failed:', err);
+
+        const message = String(err?.message || err || '');
+        const code = String(err?.code || '');
+
+        if (
+          code === 'BLUETOOTH_OFF' ||
+          /bluetooth.*(off|disabled|not enabled)|adapter.*disabled/i.test(message)
+        ) {
+          setError('Bluetooth is turned off. Turn on Bluetooth to receive offline payments.');
+        } else if (
+          code === 'BLE_ADVERTISING_UNAVAILABLE' ||
+          /advertiser.*null|advertising.*unavailable/i.test(message)
+        ) {
+          setError(
+            'BLE advertising is unavailable. Turn on Bluetooth and check whether this phone supports Bluetooth LE advertising.'
+          );
+        } else if (
+          /permission|not authorized|securityexception/i.test(message)
+        ) {
+          setError(
+            'Bluetooth permission is missing. Allow Nearby devices in Android Settings, then retry.'
+          );
+        } else {
+          setError(message || 'Could not start the Bluetooth receiver.');
+        }
+
+        setIsAdvertising(false);
+        return null;
+      }
+    },
+    [receiverId]
+  );
+
   useEffect(() => {
     let mounted = true;
+    let activeCleanup = null;
 
-    initializeReceiver(() => mounted);
+    const runSetup = async () => {
+      const cleanup = await initializeReceiver(() => mounted);
+      if (!mounted) {
+        cleanup?.();
+      } else {
+        activeCleanup = cleanup;
+      }
+    };
+
+    runSetup();
 
     return () => {
       mounted = false;
+      activeCleanup?.();
     };
   }, [initializeReceiver, attempt]);
 
@@ -113,7 +144,6 @@ const ReceiveQrScreen = ({ route }) => {
 
   const handleEnableBluetooth = () => {
     if (Platform.OS === 'android') {
-      // Opens Android settings; the user can turn Bluetooth on there.
       Linking.sendIntent('android.settings.BLUETOOTH_SETTINGS').catch(() => {
         Linking.openSettings();
       });
@@ -128,23 +158,19 @@ const ReceiveQrScreen = ({ route }) => {
   const qrPayload = JSON.stringify({
     receiverId,
     serviceUuid: WALLET_SERVICE_UUID,
-    advertisedName: `PAY_${receiverId}`,
+    advertisedName: safeAdvertisedName,
   });
 
   return (
     <View style={styles.container}>
       <Text style={styles.header}>Scan to Pay</Text>
 
-      <Text style={styles.subtext}>
-        Receiver ID: {receiverId}
-      </Text>
+      <Text style={styles.subtext}>Receiver ID: {receiverId}</Text>
 
       <View style={styles.qrContainer}>
         {error ? (
           <>
-            <Text style={styles.errorTitle}>
-              Bluetooth receiver unavailable
-            </Text>
+            <Text style={styles.errorTitle}>Bluetooth receiver unavailable</Text>
             <Text style={styles.errorText}>{error}</Text>
 
             {/turn on bluetooth|turned off/i.test(error) && (
@@ -156,27 +182,23 @@ const ReceiveQrScreen = ({ route }) => {
               </TouchableOpacity>
             )}
 
-            <TouchableOpacity
-              style={styles.secondaryButton}
-              onPress={handleRetry}
-            >
+            <TouchableOpacity style={styles.secondaryButton} onPress={handleRetry}>
               <Text style={styles.secondaryButtonText}>Try Again</Text>
             </TouchableOpacity>
           </>
-        ) : isAdvertising ? (
+        ) :  (
           <QRCode
             value={qrPayload}
             size={240}
             color="#1F2937"
             backgroundColor="#FFFFFF"
           />
-        ) : (
-          <View style={styles.loadingContainer}>
-            <ActivityIndicator size="large" color="#00BAF2" />
-            <Text style={styles.statusText}>
-              Initializing Bluetooth receiver...
-            </Text>
-          </View>
+        // ) : (
+        //   <View style={styles.loadingContainer}>
+        //     <ActivityIndicator size="large" color="#00BAF2" />
+        //     <Text style={styles.statusText}>Initializing Bluetooth receiver...</Text>
+        //   </View>
+        // )
         )}
       </View>
 
@@ -193,19 +215,22 @@ const ReceiveQrScreen = ({ route }) => {
           {error
             ? 'Bluetooth setup failed'
             : isAdvertising
-              ? 'Bluetooth receiver started'
-              : 'Setting up connection...'}
+            ? 'Bluetooth receiver started'
+            : 'Setting up connection...'}
         </Text>
       </View>
 
-      {deviceId ? (
-        <Text style={styles.deviceId}>Device: {deviceId}</Text>
-      ) : null}
+      {deviceId ? <Text style={styles.deviceId}>Device: {deviceId}</Text> : null}
 
       <PaymentSuccessModal
         visible={!!completedTxn}
         transactionData={completedTxn}
-        onClose={() => setCompletedTxn(null)}
+        onClose={() => {
+          setCompletedTxn(null);
+          if (navigation?.canGoBack()) {
+            navigation.navigate('Home', { refresh: Date.now() });
+          }
+        }}
       />
     </View>
   );
